@@ -403,6 +403,27 @@ class EDITS(nn.Module):
         if model != 'GCN':
             return "Not Implemented"
 
+        # ── sens 0/1 재매핑 ─────────────────────────────────────────
+        # income 등 sens가 {1,2} 같은 값으로 들어오는 데이터셋 대응
+        # fair_metric_direct가 sens==0 / sens==1 로 하드코딩되어 있으므로 필수
+        if torch.is_tensor(sens):
+            sens_vals = sorted(sens.unique().tolist())
+            if sens_vals != [0, 1]:
+                sens_map = {int(v): i for i, v in enumerate(sens_vals)}
+                sens_mapped = sens.clone()
+                for old_s, new_s in sens_map.items():
+                    sens_mapped[sens == old_s] = new_s
+                sens = sens_mapped
+                print(f"[EDITS] sens remapped: {sens_vals} -> {{0, 1}}")
+        else:
+            sens_vals = sorted(np.unique(sens).tolist())
+            if sens_vals != [0, 1]:
+                sens_mapped = np.zeros_like(sens)
+                for new_s, old_s in enumerate(sens_vals):
+                    sens_mapped[sens == old_s] = new_s
+                sens = sens_mapped
+                print(f"[EDITS] sens remapped: {sens_vals} -> {{0, 1}}")
+
         self.labels=labels
         self.sens=sens
 
