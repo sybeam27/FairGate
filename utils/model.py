@@ -616,22 +616,110 @@ def _get_fair_idx(data):
     return data.train_mask.nonzero(as_tuple=False).view(-1)
 
 
+# ── Auto-config 임계값 ────────────────────────────────────────────────────────
+_BOUNDARY_RATIO_THR  = 0.5   # < 0.5  : clustered      → mutual_info + scale
+_BOUNDARY_SAT_THR    = 0.9   # ≥ 0.9  : saturated      → variance + drop
+_DEG_GAP_THR         = 0.2   # > 0.2  : degree-skewed  → variance + drop
+
+
+def _compute_graph_stats(data) -> dict:
+    """
+    Auto-config 결정에 필요한 그래프 통계를 계산한다.
+
+    boundary_ratio : inter-group 이웃이 하나라도 있는 노드 비율
+                     낮으면 집단이 뭉쳐있고 경계 노드가 병목 역할
+    deg_gap        : 두 집단 평균 degree의 정규화된 차이
+                     크면 degree 불균형이 불공정성의 주요 구조적 원인
+    """
+    edge_index = data.edge_index
+    src, dst   = edge_index
+    N          = data.x.size(0)
+    device     = data.x.device
+    sens       = data.sens
+
+    deg = torch.zeros(N, device=device)
+    deg.scatter_add_(0, src, torch.ones(edge_index.size(1), device=device))
+
+    # degree gap
+    d0    = deg[sens == 0].mean().item()
+    d1    = deg[sens == 1].mean().item()
+    deg_gap = abs(d0 - d1) / (d0 + d1 + 1e-8)
+
+    # boundary ratio
+    is_inter   = (sens[src] != sens[dst])
+    has_inter  = torch.zeros(N, dtype=torch.bool, device=device)
+    has_inter[src[is_inter]] = True
+    boundary_ratio = has_inter.float().mean().item()
+
+    return {"boundary_ratio": boundary_ratio, "deg_gap": deg_gap}
+
+
+def _auto_config_from_graph_stats(boundary_ratio: float, deg_gap: float) -> dict:
+    """
+    boundary_ratio + deg_gap → (alpha_beta_mode, edge_intervention) 자동 결정.
+
+    clustered   (boundary_ratio < 0.5):
+        집단이 뭉쳐있고 경계 노드가 소수 → 경계 노드가 불공정 전파 병목.
+        MI 기반으로 정확히 타겟팅 + bridge 보존을 위해 scale.
+        → mutual_info + scale   (예: Pokec-z/n, Income)
+
+    saturated   (boundary_ratio ≥ 0.9):
+        거의 모든 노드가 경계에 있음 → scale로는 개입 효과가 너무 약함.
+        경계 신호 자체가 변별력 없으므로 엣지를 적극적으로 제거.
+        → variance + drop       (예: German, Bail, NBA)
+
+    degree-skewed  (0.5 ≤ boundary_ratio < 0.9, deg_gap > 0.2):
+        경계 노드가 많지만 degree 불균형이 주원인.
+        variance가 degree 차이를 잘 포착 + 엣지 제거 효과적.
+        → variance + drop       (예: Credit)
+
+    mixed  (0.5 ≤ boundary_ratio < 0.9, deg_gap ≤ 0.2):
+        경계 노드가 중간 수준, degree도 균등 → 엣지 감쇠가 안전.
+        → variance + scale      (예: NBA 일부)
+    """
+    if boundary_ratio < _BOUNDARY_RATIO_THR:
+        return {
+            "alpha_beta_mode" : "mutual_info",
+            "edge_intervention": "scale",
+            "regime"          : "clustered",
+        }
+    elif boundary_ratio >= _BOUNDARY_SAT_THR:
+        return {
+            "alpha_beta_mode" : "variance",
+            "edge_intervention": "drop",
+            "regime"          : "saturated",
+        }
+    elif deg_gap > _DEG_GAP_THR:
+        return {
+            "alpha_beta_mode" : "variance",
+            "edge_intervention": "drop",
+            "regime"          : "degree-skewed",
+        }
+    else:
+        return {
+            "alpha_beta_mode" : "variance",
+            "edge_intervention": "scale",
+            "regime"          : "mixed",
+        }
+
+
 class FairGate:
     """
     FairGate: Fair GNN with hierarchical FIW and 3-level fairness regularization.
 
-    Core hyperparameters:
-        lambda_fair     : overall fairness loss coefficient
-        sbrs_quantile   : boundary gating quantile (kept name for compatibility)
-        fips_lam        : uncertainty amplification inside gated nodes
-        mmd_alpha       : representation loss mixing ratio
-        struct_drop     : inter-group edge drop rate
-        warm_up         : task-only warm-up epochs
-        dp_eo_ratio     : DP/EO balance (default 0.3 → EO-oriented)
-        uncertainty_type: "entropy" (default) or "mc"
-
-    Structural priority coefficients (alpha, beta) are computed automatically
-    from signal variances — no manual boundary_weight tuning needed.
+    핵심 파라미터:
+        lambda_fair      : 전체 공정성 손실 계수
+        sbrs_quantile    : boundary gating quantile
+        fips_lam         : gated 노드 불확실성 증폭 계수
+        mmd_alpha        : representation loss 혼합 비율
+        struct_drop      : inter-group 엣지 제거율
+        warm_up          : task-only warm-up 에포크 수
+        dp_eo_ratio      : DP/EO 균형 (기본 0.3 → EO 중심)
+        recal_interval   : Phase-2에서 스케일 재보정 주기 (5번 한계 반영)
+        alpha_beta_mode  : α,β 계산 방식 — "variance"(기본) / "mutual_info" / "uniform"
+                           ablation 실험용. 기본값 variance가 가장 안정적.
+        edge_intervention: 엣지 개입 방식 — "drop"(기본) / "scale"
+                           "scale"은 bridge 엣지 보존 (4번 한계 대응 옵션)
     """
 
     def __init__(
@@ -639,23 +727,26 @@ class FairGate:
         in_feats,
         h_feats,
         device,
-        backbone        = "GCN",
-        dropout         = 0.5,
-        sgc_k           = 2,
-        lambda_fair     = 0.05,
-        sbrs_quantile   = 0.7,
-        fips_lam        = 1.0,
-        mmd_alpha       = 0.3,
-        struct_drop     = 0.5,
-        warm_up         = 200,
-        dp_eo_ratio     = 0.3,
-        ramp_epochs     = 0,
-        uncertainty_type= "entropy",
-        recal_interval  = _RECAL_INTERVAL,
-        edge_intervention: str = "drop",   # "drop" | "scale"  (4순위 개선)
+        backbone         = "GCN",
+        dropout          = 0.5,
+        sgc_k            = 2,
+        lambda_fair      = 0.05,
+        sbrs_quantile    = 0.7,
+        fips_lam         = 1.0,
+        mmd_alpha        = 0.3,
+        struct_drop      = 0.5,
+        warm_up          = 200,
+        dp_eo_ratio      = 0.3,
+        ramp_epochs      = 0,
+        uncertainty_type = "entropy",
+        recal_interval   = _RECAL_INTERVAL,
+        alpha_beta_mode  : str = "variance",   # ablation용 (3번 한계)
+        edge_intervention: str = "drop",       # bridge 보존 옵션 (4번 한계)
     ):
         assert backbone in ("GCN", "GraphSAGE", "SGC"), \
             f"Unsupported backbone: {backbone}"
+        assert alpha_beta_mode in ("variance", "mutual_info", "uniform"), \
+            f"alpha_beta_mode must be variance/mutual_info/uniform, got: {alpha_beta_mode}"
         assert edge_intervention in ("drop", "scale"), \
             f"edge_intervention must be 'drop' or 'scale', got: {edge_intervention}"
 
@@ -671,12 +762,13 @@ class FairGate:
         self.ramp_epochs       = ramp_epochs
         self.uncertainty_type  = uncertainty_type
         self.recal_interval    = recal_interval
+        self.alpha_beta_mode   = alpha_beta_mode
         self.edge_intervention = edge_intervention
 
         self.name = f"{backbone}/FairGate"
 
-        self.model   = _build_backbone(backbone, in_feats, h_feats,
-                                       dropout=dropout, sgc_k=sgc_k).to(device)
+        self.model      = _build_backbone(backbone, in_feats, h_feats,
+                                          dropout=dropout, sgc_k=sgc_k).to(device)
         self._rep_loss  = RepresentationLoss(mmd_alpha=mmd_alpha)
         self._scales    = {"struct": 1.0, "rep": 1.0, "out": 1.0}
         self._node_w    = None
@@ -706,13 +798,17 @@ class FairGate:
         _log_fiw(self.name, "Phase 2 (hierarchical FIW)", meta, self._node_w)
 
     def _refresh_weights(self, data, epoch):
-        self._node_w, meta = compute_fiw_weights(
+        new_w, meta = compute_fiw_weights(
             data,
             model=self.model,
             sbrs_quantile=self.sbrs_quantile,
             fips_lam=self.fips_lam,
             uncertainty_type=self.uncertainty_type,
         )
+        if torch.isnan(new_w).any():
+            print(f"[{self.name}] [Refresh@{epoch}] NaN detected — skipping update")
+            return
+        self._node_w = new_w
         print(
             f"[{self.name}] [Refresh@{epoch}] "
             f"gated={meta['gated']}/{meta['n_total']} | "
@@ -732,7 +828,10 @@ class FairGate:
 
         def _s(loss_fn):
             v = loss_fn().item()
-            return task_val / (v + 1e-8)
+            if not (v > 1e-6):          # NaN / 0 / inf 모두 처리
+                return 1.0
+            raw = task_val / (v + 1e-8)
+            return float(min(raw, 100.0))   # 상한선 100배
 
         self._scales["struct"] = _s(lambda: compute_structural_loss(
             self.model, data, self._node_w, self.struct_drop,
@@ -803,6 +902,25 @@ class FairGate:
 
         optimizer = self._optimizer(lr, weight_decay)
         criterion = nn.BCEWithLogitsLoss()
+
+        # ── 그래프 통계 진단 로그 (성능에 영향 없음) ─────────────────────────
+        homophily      = _compute_edge_homophily(data)
+        stats          = _compute_graph_stats(data)
+        boundary_ratio = stats["boundary_ratio"]
+        deg_gap        = stats["deg_gap"]
+        # data에 alpha_beta_mode 부착 → compute_fiw_weights 내부에서 읽힘
+        data.alpha_beta_mode = self.alpha_beta_mode
+        if verbose:
+            print(
+                f"[{self.name}] Config | "
+                f"homophily={homophily:.4f}  "
+                f"boundary_ratio={boundary_ratio:.4f}  "
+                f"deg_gap={deg_gap:.4f} | "
+                f"alpha_beta={self.alpha_beta_mode}  "
+                f"edge={self.edge_intervention}  "
+                f"recal_interval={self.recal_interval}"
+            )
+        # ─────────────────────────────────────────────────────────────────────
 
         # Phase 1: structure-only warm-up
         self._init_weights_warmup(data)

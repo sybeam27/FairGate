@@ -13,9 +13,15 @@ run.py — FairGate + 비교 모델 전체 실험 실행기
     FairGate + 비교 모델 결과 모두 누적 저장 (dataset, model 열로 구분)
 """
 
-# python run.py --run_name exp_baselines --mode baselines --models FairGT --datasets pokec_z pokec_n pokec_z_g pokec_n_g german credit income recidivism nba
+# # 기본
+# python run.py --run_name exp_fairgate_v5 --mode fairgate
 
-# python run.py --run_name exp_fairgate_v2 --mode fairgate --datasets pokec_z pokec_n pokec_z_g pokec_n_g german credit income recidivism nba
+# # 3번 한계 ablation
+# python train.py --dataset pokec_z --backbone GCN --alpha_beta_mode mutual_info
+# python train.py --dataset pokec_z --backbone GCN --alpha_beta_mode uniform
+
+# # 4번 한계 ablation
+# python train.py --dataset credit --backbone GCN --edge_intervention scale
 
 import subprocess
 import sys
@@ -120,6 +126,11 @@ FAIRGATE_CONFIGS = {
 }
 
 # ── 비교 모델 목록 ────────────────────────────────────────────────────────
+ALL_DATASETS = [
+    "pokec_z", "pokec_n", "pokec_z_g", "pokec_n_g",
+    "german", "credit", "income", "recidivism", "nba",
+]
+
 BASELINE_MODELS = [
     # "GNN",
     "NIFTY", "FairGB", "FairGT",
@@ -280,7 +291,8 @@ def parse_args():
     p.add_argument("--backbone", type=str, default="GCN",
                    choices=["GCN", "GraphSAGE", "SGC"])
     p.add_argument("--datasets", nargs="+",
-                   default=list(FAIRGATE_CONFIGS.keys()))
+                   default=ALL_DATASETS,
+                   help="실행할 데이터셋 목록 (기본: 전체 9개)")
     p.add_argument("--models",   nargs="+",
                    default=BASELINE_MODELS,
                    help="비교 모델 목록 (baselines/all 모드)")

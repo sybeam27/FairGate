@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from model import FairGate
+from utils.model import FairGate
 from utils.data  import get_dataset
 
 
@@ -48,7 +48,8 @@ def save_summary(summary: pd.DataFrame, args: argparse.Namespace):
     config = vars(args).copy()
     config.pop("dataset", None)
     for col, val in config.items():
-        summary[col] = val
+        if col not in summary.columns:
+            summary[col] = val
 
     dedup_keys = [
         "dataset", "task", "model",
@@ -95,15 +96,12 @@ def run_experiment(data, args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     data   = data.to(device)
 
-    # alpha_beta_mode를 data에 메타속성으로 부착
-    # → compute_fiw_weights 내에서 getattr(data, "alpha_beta_mode", "variance")로 읽힘
-    data.alpha_beta_mode = args.alpha_beta_mode
-
     print(f"\n{'='*70}")
     print(f"[Run] seed={args.seed} | backbone={args.backbone} | "
           f"λ={args.lambda_fair} q={args.sbrs_quantile} "
           f"λ_u={args.fips_lam} α={args.mmd_alpha} "
-          f"p={args.struct_drop} T_w={args.warm_up}")
+          f"p={args.struct_drop} T_w={args.warm_up} | "
+          f"alpha_beta={args.alpha_beta_mode} edge={args.edge_intervention}")
     print(f"{'='*70}")
 
     model = FairGate(
@@ -123,6 +121,7 @@ def run_experiment(data, args):
         ramp_epochs      = args.ramp_epochs,
         uncertainty_type = args.uncertainty_type,
         recal_interval   = args.recal_interval,
+        alpha_beta_mode  = args.alpha_beta_mode,
         edge_intervention= args.edge_intervention,
     )
 
@@ -136,10 +135,13 @@ def run_experiment(data, args):
     )
 
     result = model.evaluate(data, split="test")
-    # backbone 대신 model 열로 저장 (train_baselines.py와 통일)
-    return pd.DataFrame([{"task": "classification",
-                          "model": "FairGate",
-                          **result}])
+    return pd.DataFrame([{
+        "task"             : "classification",
+        "model"            : "FairGate",
+        "alpha_beta_mode"  : args.alpha_beta_mode,
+        "edge_intervention": args.edge_intervention,
+        **result,
+    }])
 
 
 def parse_args():
@@ -183,12 +185,12 @@ def parse_args():
     g.add_argument("--ramp_epochs", type=int,   default=0)
     g.add_argument("--recal_interval", type=int, default=200,
                    help="Phase-2 epochs between periodic scale recalibrations")
-    g.add_argument("--alpha_beta_mode", type=str, default="mutual_info",
+    g.add_argument("--alpha_beta_mode", type=str, default="variance",
                    choices=["variance", "mutual_info", "uniform"],
-                   help="Method for computing structural priority coefficients α, β")
-    g.add_argument("--edge_intervention", type=str, default="scale",
+                   help="α,β 계산 방식. ablation용 (기본: variance)")
+    g.add_argument("--edge_intervention", type=str, default="drop",
                    choices=["drop", "scale"],
-                   help="Inter-group edge intervention: hard drop vs soft attention scaling")
+                   help="엣지 개입 방식. scale은 bridge 보존 (기본: drop)")
 
     return parser.parse_args()
 
@@ -206,11 +208,23 @@ if __name__ == "__main__":
 
     data, sens_idx, x_min, x_max = get_dataset(args.dataset)
 
-    # ── Homophily 출력 ────────────────────────────────────────────────────────
-    src, dst   = data.edge_index
-    homophily  = (data.sens[src] == data.sens[dst]).float().mean().item()
-    gating_mode = "heterophilic (loss-based)" if homophily < 0.5 else "boundary"
-    print(f"[Homophily] {homophily:.4f}  →  gating mode: {gating_mode}")
+    # ── 그래프 통계 출력 ──────────────────────────────────────────────────────
+    src, dst       = data.edge_index
+    N              = data.x.size(0)
+    homophily      = (data.sens[src] == data.sens[dst]).float().mean().item()
+    deg            = torch.zeros(N).scatter_add_(0, src, torch.ones(src.size(0)))
+    d0 = deg[data.sens==0].mean().item(); d1 = deg[data.sens==1].mean().item()
+    deg_gap        = abs(d0-d1)/(d0+d1+1e-8)
+    is_inter       = (data.sens[src] != data.sens[dst])
+    has_inter      = torch.zeros(N, dtype=torch.bool)
+    has_inter[src[is_inter]] = True
+    boundary_ratio = has_inter.float().mean().item()
+    from utils.model import _auto_config_from_graph_stats
+    regime = _auto_config_from_graph_stats(boundary_ratio, deg_gap)["regime"]
+    print(f"[Graph Stats] homophily={homophily:.4f}  "
+          f"boundary_ratio={boundary_ratio:.4f}  "
+          f"deg_gap={deg_gap:.4f}  →  regime={regime}")
+    # ─────────────────────────────────────────────────────────────────────────
 
     print(f"[Split] train={data.train_mask.sum().item()} | "
           f"val={data.val_mask.sum().item()} | "
