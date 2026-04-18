@@ -25,8 +25,8 @@ import pandas as pd
 import torch
 import scipy.sparse as sp
 
-from utils.dataloading import load_data
-from utils.data import get_dataset
+from .dataloading import load_data
+from .data import get_dataset
 import torch.nn.functional as F
 import scipy.sparse as sp
 from scipy.sparse.linalg import eigsh
@@ -40,8 +40,8 @@ from algorithms.CrossWalk import CrossWalk
 from algorithms.EDITS    import EDITS
 from algorithms.FairEdit import FairEdit
 from algorithms.NIFTY    import NIFTY
-from algorithms.FairGB   import FairGB
-from algorithms.FairGT   import FairGT
+from algorithms.FairGB_alg   import FairGB
+from algorithms.FairGT_alg   import FairGT
 
 # ── 메트릭 컬럼명 (train.py와 동일한 순서) ───────────────────────────────
 METRIC_NAMES = [
@@ -139,6 +139,7 @@ def save_summary(all_results: list, args: argparse.Namespace):
         "f1_mean", "f1_std",
         "dp_mean", "dp_std",
         "eo_mean", "eo_std",
+        "time_sec_mean", "time_sec_std",
     ]
 
     dedup_keys = ["dataset", "task", "model"]
@@ -175,192 +176,6 @@ def save_summary(all_results: list, args: argparse.Namespace):
             print(f"    {col}: {summary[col].values[0]:.4f}")
     if "time_sec_mean" in summary.columns:
         print(f"    time_sec: {summary['time_sec_mean'].values[0]:.1f} ± {summary['time_sec_std'].values[0]:.1f}s")
-
-
-def _pyg_data_to_scipy_adj(data):
-    edge_index = data.edge_index.cpu().numpy()
-    n = data.x.size(0)
-    adj = sp.coo_matrix(
-        (np.ones(edge_index.shape[1], dtype=np.float32),
-         (edge_index[0], edge_index[1])),
-        shape=(n, n),
-        dtype=np.float32,
-    ).tocsr()
-    adj = adj.maximum(adj.T)
-    adj.setdiag(0.0)
-    adj.eliminate_zeros()
-    return adj
-
-
-def _drop_feature_col(x: torch.Tensor, col_idx: int) -> torch.Tensor:
-    return torch.cat([x[:, :col_idx], x[:, col_idx + 1:]], dim=1)
-
-
-def _adjacency_positional_encoding(adj: sp.csr_matrix, pe_dim: int) -> torch.Tensor:
-    n = adj.shape[0]
-    k = min(pe_dim, max(1, n - 2))
-    if pe_dim <= 0:
-        return torch.zeros((n, 0), dtype=torch.float32)
-
-    try:
-        vals, vecs = eigsh(adj.astype(np.float32), k=k, which="LM")
-        order = np.argsort(-np.abs(vals))
-        vecs = vecs[:, order]
-    except Exception:
-        dense = adj.toarray().astype(np.float32)
-        vals, vecs = np.linalg.eigh(dense)
-        order = np.argsort(-np.abs(vals))[:k]
-        vecs = vecs[:, order]
-
-    return torch.from_numpy(vecs.astype(np.float32))
-
-
-def _augment_same_sens_graph(
-    adj: sp.csr_matrix,
-    sens: np.ndarray,
-    sample_k: int | None = None,
-    seed: int = 0,
-) -> sp.csr_matrix:
-    """
-    FairGT의 same-sensitive topology를 baseline runner에서 안전하게 흉내낸 버전.
-    작은 그래프는 same-sens clique, 큰 그래프는 node당 sample_k개만 추가.
-    """
-    rng = np.random.default_rng(seed)
-    n = adj.shape[0]
-
-    rows, cols = [], []
-    for g in np.unique(sens):
-        idx = np.where(sens == g)[0]
-        if len(idx) <= 1:
-            continue
-
-        if sample_k is None or len(idx) <= sample_k + 1:
-            rr = np.repeat(idx, len(idx))
-            cc = np.tile(idx, len(idx))
-            mask = rr != cc
-            rows.append(rr[mask])
-            cols.append(cc[mask])
-        else:
-            for i in idx:
-                peers = idx[idx != i]
-                k = min(sample_k, len(peers))
-                chosen = rng.choice(peers, size=k, replace=False)
-                rows.append(np.full(k, i))
-                cols.append(chosen)
-
-    if len(rows) == 0:
-        aug = adj.copy().tocsr()
-        aug.setdiag(1.0)
-        return aug
-
-    rows = np.concatenate(rows)
-    cols = np.concatenate(cols)
-
-    same_adj = sp.coo_matrix(
-        (np.ones(len(rows), dtype=np.float32), (rows, cols)),
-        shape=(n, n),
-        dtype=np.float32,
-    ).tocsr()
-
-    aug = (adj + same_adj).astype(np.float32)
-    aug.data[:] = 1.0
-    aug = aug.maximum(aug.T)
-    aug.setdiag(1.0)
-    aug.eliminate_zeros()
-    return aug
-
-
-def _row_normalize_sparse(adj: sp.csr_matrix) -> sp.csr_matrix:
-    rowsum = np.asarray(adj.sum(1)).flatten()
-    rowsum[rowsum == 0] = 1.0
-    inv = 1.0 / rowsum
-    return sp.diags(inv).dot(adj).tocsr()
-
-
-def _re_features(adj: sp.csr_matrix, features: torch.Tensor, hops: int) -> torch.Tensor:
-    """
-    [N, F] -> [N, hops+1, F]
-    """
-    adj_norm = _row_normalize_sparse(adj)
-    x = features.cpu().numpy().astype(np.float32)
-
-    outs = [torch.from_numpy(x)]
-    cur = x
-    for _ in range(hops):
-        cur = adj_norm @ cur
-        outs.append(torch.from_numpy(cur.astype(np.float32)))
-
-    return torch.stack(outs, dim=1)
-
-
-def _safe_auc(y_true, y_score) -> float:
-    y_true = np.asarray(y_true)
-    y_score = np.asarray(y_score)
-    if len(np.unique(y_true)) < 2:
-        return 0.5
-    return float(roc_auc_score(y_true, y_score))
-
-
-def _group_fairness_binary(y_true, sens, y_pred):
-    y_true = np.asarray(y_true)
-    sens = np.asarray(sens)
-    y_pred = np.asarray(y_pred)
-
-    m0 = sens == 0
-    m1 = sens == 1
-
-    dp0 = y_pred[m0].mean() if m0.any() else 0.0
-    dp1 = y_pred[m1].mean() if m1.any() else 0.0
-    dp = abs(dp0 - dp1)
-
-    e0 = ((y_true == 1) & m0)
-    e1 = ((y_true == 1) & m1)
-    eo0 = y_pred[e0].mean() if e0.any() else 0.0
-    eo1 = y_pred[e1].mean() if e1.any() else 0.0
-    eo = abs(eo0 - eo1)
-
-    return float(dp), float(eo)
-
-
-def _binary_metrics_dict(labels, sens, prob1, pred, idx):
-    idx = idx.detach().cpu().numpy() if torch.is_tensor(idx) else np.asarray(idx)
-
-    y = labels.detach().cpu().numpy()[idx]
-    s = sens.detach().cpu().numpy()[idx]
-    p = pred.detach().cpu().numpy()[idx]
-    prob = prob1.detach().cpu().numpy()[idx]
-
-    def _subset_metrics(mask):
-        if mask.sum() == 0:
-            return 0.0, 0.5, 0.0
-        yy, pp, pr = y[mask], p[mask], prob[mask]
-        acc = float(accuracy_score(yy, pp))
-        auc = _safe_auc(yy, pr)
-        f1 = float(f1_score(yy, pp, zero_division=0))
-        return acc, auc, f1
-
-    acc = float(accuracy_score(y, p))
-    auc = _safe_auc(y, prob)
-    f1 = float(f1_score(y, p, zero_division=0))
-
-    acc0, auc0, f10 = _subset_metrics(s == 0)
-    acc1, auc1, f11 = _subset_metrics(s == 1)
-
-    dp, eo = _group_fairness_binary(y, s, p)
-
-    return {
-        "acc": acc,
-        "roc_auc": auc,
-        "f1": f1,
-        "acc_sens0": acc0,
-        "roc_auc_sens0": auc0,
-        "f1_sens0": f10,
-        "acc_sens1": acc1,
-        "roc_auc_sens1": auc1,
-        "f1_sens1": f11,
-        "dp": dp,
-        "eo": eo,
-    }
 
 
 # ============================================================
@@ -535,7 +350,7 @@ def run_model(args, param1, param2, seed: int) -> dict:
     elif model_name == "FairGT":
         data, sens_idx, _, _ = get_dataset(dataset)
         model = FairGT(data, sens_idx, args, lr=lr, weight_decay=wd, device=device)
-        model.fit(epochs=epochs)
+        model.fit(epochs=epochs, patience=args.patience)
         return pack_result(model.predict())
     
     else:
@@ -564,8 +379,8 @@ def parse_args():
     g = parser.add_argument_group("Training  [identical to train.py]")
     g.add_argument("--lr",           type=float, default=1e-3)
     g.add_argument("--weight_decay", type=float, default=1e-5)
-    g.add_argument("--epochs",       type=int,   default=1000)
-    g.add_argument("--patience",     type=int,   default=100)
+    g.add_argument("--epochs",   type=int, default=500)  # 수정
+    g.add_argument("--patience", type=int, default=501)  # 수정
     g.add_argument("--seed",         type=int,   default=27)
     g.add_argument("--runs",         type=int,   default=5)
     g.add_argument("--device",       type=str,   default="cuda")
@@ -577,7 +392,7 @@ def parse_args():
 
     # ── 저장 설정 (train.py와 완전히 동일한 인자명/로직)
     g = parser.add_argument_group("Output  [identical to train.py]")
-    g.add_argument("--save_dir",    type=str, default="outputs/",
+    g.add_argument("--save_dir",    type=str, default="outputs/compare/",
                    help="결과 파일이 저장될 디렉토리")
     g.add_argument("--run_name",    type=str, default=None,
                    help="결과 파일 이름 (확장자 제외). 예: exp_0412_v2")

@@ -68,8 +68,8 @@ FIXED = {
     "dropout"          : 0.5,
     "lr"               : 1e-3,
     "weight_decay"     : 1e-5,
-    "epochs"           : 1000,
-    "patience"         : 100,
+    "epochs"           : 500,
+    "patience"         : 501,
     "runs"             : 3,       # 탐색 속도용; 최종 실험은 5
     "seed"             : 27,
     "recal_interval"   : 200,
@@ -77,6 +77,7 @@ FIXED = {
     "ramp_epochs"      : 0,
     "alpha_beta_mode"  : "variance",
     "edge_intervention": "drop",
+    "boundary_sat_thr" : 0.9,        # τ FIXED — sensitivity에서 별도 검증
 }
 
 
@@ -117,6 +118,7 @@ def build_cmd(dataset: str, backbone: str, output_file: str,
         "--ramp_epochs",       str(cfg["ramp_epochs"]),
         "--alpha_beta_mode",   cfg["alpha_beta_mode"],
         "--edge_intervention", cfg["edge_intervention"],
+        "--boundary_sat_thr",  str(cfg["boundary_sat_thr"]),
     ]
 
 
@@ -174,6 +176,7 @@ def print_top5(output_file: str, dataset: str):
         print(f"    \"struct_drop\":   {best.get('struct_drop', '?')},")
         print(f"    \"warm_up\":       {int(best.get('warm_up', 200))},")
         print(f"    \"dp_eo_ratio\":   {best.get('dp_eo_ratio', '?')},")
+        print(f"    \"boundary_sat_thr\": {best.get('boundary_sat_thr', 0.9)},")
 
     except Exception as e:
         print(f"  [결과 요약 실패] {e}")
@@ -196,7 +199,7 @@ def parse_args():
                    help="full=전체 grid, random=무작위 샘플링")
     p.add_argument("--n_samples", type=int, default=30,
                    help="random 모드에서 데이터셋당 샘플링 수")
-    p.add_argument("--output_dir", type=str, default="hparam",
+    p.add_argument("--output_dir", type=str, default="outputs/hparam",
                    help="결과 저장 디렉토리 (데이터셋별 CSV 분리)")
     p.add_argument("--log_dir",   type=str, default="logs/hparam")
     p.add_argument("--search_seed", type=int, default=42,

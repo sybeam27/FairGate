@@ -344,8 +344,8 @@ class NIFTY(torch.nn.Module):
             loss = F.cross_entropy(preds, labels[idx_train])
             loss.backward()
             optimizer.step()
-            if i%100==0:
-                print(loss.item())
+            # if i%100==0:
+            #     print(loss.item())
         classifier.eval()
         preds = classifier(x[idx_test]).argmax(dim=1)
         correct = (preds == labels[idx_test]).sum().item()
@@ -496,7 +496,7 @@ class NIFTY(torch.nn.Module):
                 self.val_loss=val_c_loss.item()+val_s_loss.item()
 
 
-                print(f'{epoch} | {val_s_loss:.4f} | {val_c_loss:.4f}')
+                # print(f'{epoch} | {val_s_loss:.4f} | {val_c_loss:.4f}')
                 best_loss = val_c_loss + val_s_loss
                 self.best_state_ssf = copy.deepcopy(self.state_dict())
 

@@ -4,10 +4,10 @@ import numpy as np
 import torch.nn.functional as F
 from sklearn.metrics import f1_score, accuracy_score, roc_auc_score
 
-from FairGB.models import *
-from FairGB.eval import evaluate_ged3
-from FairGB.utils import seed_everything, get_enc_cls_opt
-from FairGB.mixup import (sampling_idx_individual_dst, neighbor_sampling,
+from .FairGB.models import *
+from .FairGB.eval import evaluate_ged3
+from .FairGB.utils import seed_everything, get_enc_cls_opt
+from .FairGB.mixup import (sampling_idx_individual_dst, neighbor_sampling,
                                    get_ins_neighbor_dist, saliency_mixup)
 
 EPS = 1e-6

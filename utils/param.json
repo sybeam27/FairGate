@@ -53,7 +53,8 @@
         "credit": {"num_walks": 10, "walk_length": 10}, 
         "pokec_z": {"num_walks": 5, "walk_length": 20}, "pokec_z_g": {"num_walks": 5, "walk_length": 20}, 
         "pokec_n": {"num_walks": 15, "walk_length": 10}, "pokec_n_g": {"num_walks": 15, "walk_length": 10},
-        "nba": {"num_walks": 5, "walk_length": 20}, "income": {"num_walks": 10, "walk_length": 10}
+        "nba": {"num_walks": 5, "walk_length": 25}, 
+        "income": {"num_walks": 10, "walk_length": 10}
     },
 
     "CrossWalk": {
@@ -62,6 +63,7 @@
         "credit": {"num_walks": 7, "walk_length": 15}, 
         "pokec_z": {"num_walks": 3, "walk_length": 10}, "pokec_z_g": {"num_walks": 3, "walk_length": 10}, 
         "pokec_n": {"num_walks": 3, "walk_length": 15}, "pokec_n_g": {"num_walks": 3, "walk_length": 15},
-        "nba": {"num_walks": 5, "walk_length": 20}, "income": {"num_walks": 7, "walk_length": 15}
+        "nba": {"num_walks": 5, "walk_length": 20}, 
+        "income": {"num_walks": 7, "walk_length": 15}
     }
 }

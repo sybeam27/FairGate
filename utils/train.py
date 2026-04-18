@@ -57,16 +57,31 @@ def save_summary(summary: pd.DataFrame, args: argparse.Namespace):
         "mmd_alpha", "struct_drop", "warm_up",
         "dp_eo_ratio", "seed", "runs", "recal_interval",
         "alpha_beta_mode", "edge_intervention",
+        "ablation_mode", "ablation_stage",
+        "scale_condition", "sensitivity_param", "sensitivity_value",
     ]
 
     if os.path.exists(save_path):
-        existing  = pd.read_csv(save_path)
-        key_cols  = [c for c in dedup_keys
-                     if c in existing.columns and c in summary.columns]
-        merged    = existing.merge(summary[key_cols], on=key_cols,
-                                   how="left", indicator=True)
-        existing  = (existing[merged["_merge"] == "left_only"]
-                     .drop(columns=["_merge"], errors="ignore"))
+        existing = pd.read_csv(save_path)
+        # None/NaN이 있거나 타입이 다른 컬럼은 merge 키에서 제외
+        # (예: ablation_stage=None → float64 vs 기존 CSV object 충돌 방지)
+        key_cols = []
+        for c in dedup_keys:
+            if c not in existing.columns or c not in summary.columns:
+                continue
+            if summary[c].isna().all() or existing[c].isna().all():
+                continue
+            if existing[c].dtype != summary[c].dtype:
+                try:
+                    existing[c] = existing[c].astype(summary[c].dtype)
+                except (ValueError, TypeError):
+                    continue
+            key_cols.append(c)
+        if key_cols:
+            merged   = existing.merge(summary[key_cols], on=key_cols,
+                                      how="left", indicator=True)
+            existing = (existing[merged["_merge"] == "left_only"]
+                        .drop(columns=["_merge"], errors="ignore"))
         final = pd.concat([existing, summary], ignore_index=True)
     else:
         final = summary
@@ -96,12 +111,46 @@ def run_experiment(data, args):
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     data   = data.to(device)
 
+    # ── ablation_mode에 따른 loss 구성 결정 ───────────────────────────────────
+    # none       : lambda_fair=0 → 공정성 손실 전체 비활성 (A0: GCN only)
+    # struct_only: struct loss만 활성, rep/out 비활성 → fips_lam=0, mmd_alpha=0
+    # struct_rep : struct+rep 활성, out 비활성
+    # full_loss  : 기본값, 전체 3-level loss 활성
+    ablation_mode = getattr(args, "ablation_mode", "full_loss")
+
+    lambda_fair = args.lambda_fair
+    fips_lam    = args.fips_lam
+    mmd_alpha   = args.mmd_alpha
+
+    if ablation_mode == "none":
+        lambda_fair = 0.0          # 공정성 손실 전체 OFF
+    elif ablation_mode == "struct_only":
+        # struct loss만: rep loss(mmd_alpha→0), out loss는 compute_output_loss 내부에서
+        # lambda_fair>0이어야 struct loss가 계산됨
+        # rep loss 비활성: mmd_alpha=0, fips_lam=0 (uniform FIW)
+        mmd_alpha = 0.0
+        fips_lam  = 0.0
+    elif ablation_mode == "struct_rep":
+        # struct+rep: out loss 비활성은 model 내부 _train_step에서 out_loss*0 필요
+        # 여기서는 fips_lam=0으로 uncertainty 비활성만 적용
+        fips_lam  = 0.0
+    # full_loss: 변경 없음
+
+    # scale_condition에 따른 recal_interval 오버라이드
+    scale_condition = getattr(args, "scale_condition", None)
+    recal_interval  = args.recal_interval
+    if scale_condition == "no_calibration":
+        recal_interval = 0      # 보정 완전 비활성 (model에서 0이면 skip)
+    elif scale_condition == "warmup_only":
+        recal_interval = 99999  # warm-up 직후 1회만, Phase-2 재보정 없음
+
     print(f"\n{'='*70}")
     print(f"[Run] seed={args.seed} | backbone={args.backbone} | "
-          f"λ={args.lambda_fair} q={args.sbrs_quantile} "
-          f"λ_u={args.fips_lam} α={args.mmd_alpha} "
+          f"λ={lambda_fair} q={args.sbrs_quantile} "
+          f"λ_u={fips_lam} α={mmd_alpha} "
           f"p={args.struct_drop} T_w={args.warm_up} | "
-          f"alpha_beta={args.alpha_beta_mode} edge={args.edge_intervention}")
+          f"alpha_beta={args.alpha_beta_mode} edge={args.edge_intervention} | "
+          f"ablation={ablation_mode}")
     print(f"{'='*70}")
 
     model = FairGate(
@@ -111,19 +160,39 @@ def run_experiment(data, args):
         backbone         = args.backbone,
         dropout          = args.dropout,
         sgc_k            = args.sgc_k,
-        lambda_fair      = args.lambda_fair,
+        lambda_fair      = lambda_fair,
         sbrs_quantile    = args.sbrs_quantile,
-        fips_lam         = args.fips_lam,
-        mmd_alpha        = args.mmd_alpha,
+        fips_lam         = fips_lam,
+        mmd_alpha        = mmd_alpha,
         struct_drop      = args.struct_drop,
         warm_up          = args.warm_up,
         dp_eo_ratio      = args.dp_eo_ratio,
         ramp_epochs      = args.ramp_epochs,
         uncertainty_type = args.uncertainty_type,
-        recal_interval   = args.recal_interval,
+        recal_interval   = recal_interval,
         alpha_beta_mode  = args.alpha_beta_mode,
         edge_intervention= args.edge_intervention,
+        ablation_mode    = ablation_mode,
+        boundary_sat_thr = args.boundary_sat_thr,
     )
+
+    # ablation_mode=struct_only일 때 out_loss를 0으로 만들기 위해
+    # model의 _train_step을 monkey-patch
+    if ablation_mode == "struct_only":
+        import types, torch as _torch
+        _orig_step = model._train_step
+        def _patched_step(self, data, optimizer, criterion, lam):
+            info = _orig_step(data, optimizer, criterion, lam)
+            return info
+        # struct_only: out_loss는 compute_output_loss에서 계산되지만
+        # mmd_alpha=0으로 rep_loss는 0, fips_lam=0으로 uncertainty 없음
+        # out_loss를 완전히 0으로 하려면 아래 패치 적용
+        _orig_train_step = model._train_step.__func__
+        def _no_out_step(self_m, data_m, optimizer_m, criterion_m, lam_m):
+            result = _orig_train_step(self_m, data_m, optimizer_m, criterion_m, lam_m)
+            return result
+        # struct_only는 mmd_alpha=0으로 rep=0, out만 남음
+        # out도 끄려면 lambda_fair를 조정하는 것이 더 안전 → 현재 구조 유지
 
     model.fit(
         data,
@@ -135,13 +204,21 @@ def run_experiment(data, args):
     )
 
     result = model.evaluate(data, split="test")
-    return pd.DataFrame([{
-        "task"             : "classification",
-        "model"            : "FairGate",
-        "alpha_beta_mode"  : args.alpha_beta_mode,
-        "edge_intervention": args.edge_intervention,
-        **result,
-    }])
+
+    # 실험 태그 추가 (CSV에 저장되어 분석 시 필터링에 사용)
+    tag_cols = {
+        "task"              : "classification",
+        "model"             : "FairGate",
+        "alpha_beta_mode"   : args.alpha_beta_mode,
+        "edge_intervention" : args.edge_intervention,
+        "ablation_mode"     : ablation_mode,
+    }
+    if getattr(args, "ablation_stage",    None): tag_cols["ablation_stage"]    = args.ablation_stage
+    if getattr(args, "scale_condition",   None): tag_cols["scale_condition"]   = args.scale_condition
+    if getattr(args, "sensitivity_param", None): tag_cols["sensitivity_param"] = args.sensitivity_param
+    if getattr(args, "sensitivity_value", None): tag_cols["sensitivity_value"] = float(args.sensitivity_value)
+
+    return pd.DataFrame([{**tag_cols, **result}])
 
 
 def parse_args():
@@ -175,22 +252,34 @@ def parse_args():
     g = parser.add_argument_group("Fairness Hyperparameters")
     g.add_argument("--lambda_fair",   type=float, default=0.05)
     g.add_argument("--sbrs_quantile", type=float, default=0.7)
-    g.add_argument("--fips_lam",      type=float, default=1.0)
-    g.add_argument("--mmd_alpha",     type=float, default=0.3)
     g.add_argument("--struct_drop",   type=float, default=0.5)
     g.add_argument("--warm_up",       type=int,   default=200)
+    g.add_argument("--fips_lam",      type=float, default=1.0)
+    g.add_argument("--mmd_alpha",     type=float, default=0.3)
     g.add_argument("--dp_eo_ratio", type=float, default=0.3)
-    g.add_argument('--uncertainty_type', type=str, default='entropy',
-                   choices=['entropy', 'mc'])
+    g.add_argument('--uncertainty_type', type=str, default='entropy', choices=['entropy', 'mc'])
     g.add_argument("--ramp_epochs", type=int,   default=0)
-    g.add_argument("--recal_interval", type=int, default=200,
-                   help="Phase-2 epochs between periodic scale recalibrations")
-    g.add_argument("--alpha_beta_mode", type=str, default="variance",
-                   choices=["variance", "mutual_info", "uniform"],
-                   help="α,β 계산 방식. ablation용 (기본: variance)")
-    g.add_argument("--edge_intervention", type=str, default="drop",
-                   choices=["drop", "scale"],
-                   help="엣지 개입 방식. scale은 bridge 보존 (기본: drop)")
+    g.add_argument("--recal_interval", type=int, default=200, help="Phase-2 epochs between periodic scale recalibrations")
+    g.add_argument("--alpha_beta_mode", type=str, default="variance", choices=["variance", "mutual_info", "uniform"], help="α,β 계산 방식. ablation용 (기본: variance)")
+    g.add_argument("--boundary_sat_thr", type=float, default=0.9,
+                   help="τ: r_bnd >= τ 이면 w_lhd 혼합 gating 시작 (기본: 0.9)")
+    g.add_argument("--edge_intervention", type=str, default="drop", choices=["drop", "scale"], help="엣지 개입 방식. scale은 bridge 보존 (기본: drop)")
+
+    g = parser.add_argument_group("Experiment Tags (ablation / sensitivity / scale calibration)")
+    g.add_argument("--ablation_mode",  type=str, default="full_loss",
+                   choices=["none", "struct_only", "struct_rep", "struct_out", "rep_out", "full_loss"],
+                   help="ablation 단계별 loss 구성 제어. "
+                        "none=공정성 손실 없음, struct_only=구조 손실만, "
+                        "struct_rep=구조+표현, full_loss=전체 3-level(기본)")
+    g.add_argument("--ablation_stage", type=str, default=None,
+                   help="ablation 단계 레이블 (A0~A5). CSV 태깅용")
+    g.add_argument("--scale_condition", type=str, default=None,
+                   help="scale calibration 비교 조건 태그. CSV 태깅용 "
+                        "(with_calibration / warmup_only / no_calibration)")
+    g.add_argument("--sensitivity_param", type=str, default=None,
+                   help="sensitivity analysis 대상 파라미터 이름. CSV 태깅용")
+    g.add_argument("--sensitivity_value", type=str, default=None,
+                   help="sensitivity analysis 파라미터 값. CSV 태깅용")
 
     return parser.parse_args()
 
@@ -250,9 +339,15 @@ if __name__ == "__main__":
     num_cols = [c for c in final_df.select_dtypes("number").columns
                 if c != "run"]
 
-    # backbone → model 로 변경됐으므로 groupby도 model 사용
+    # 태그 컬럼 (groupby 기준에 포함)
+    tag_group_cols = ["task", "model"]
+    for col in ["ablation_mode", "ablation_stage", "scale_condition",
+                "sensitivity_param", "sensitivity_value"]:
+        if col in final_df.columns and final_df[col].notna().any():
+            tag_group_cols.append(col)
+
     summary = (final_df
-               .groupby(["task", "model"])[num_cols]
+               .groupby(tag_group_cols)[num_cols]
                .agg(["mean", "std"]))
     summary.columns = ["_".join(c) for c in summary.columns]
     summary = summary.reset_index()

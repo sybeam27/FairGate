@@ -282,26 +282,31 @@ def compute_fiw_weights(
     sbrs_quantile=0.7,
     fips_lam=1.0,
     uncertainty_type="entropy",
+    boundary_sat_thr=0.9,
 ):
     """
     Compute Hierarchical Fairness Intervention Weights (FIW).
 
     Revised rule:
-        1) Gate nodes by high boundary risk:
-           G = {v | w_boundary(v) >= quantile_q}
-        2) Inside the gate, compute a structural priority score using
-           data-driven (variance-based) coefficients:
+        1) Determine gating signal G based on graph regime:
+           - boundary   (default):   G = w_boundary
+           - heterophilic (h<0.5):   G = mix(w_boundary, loss_signal)
+           - saturated (bnd≥0.9):    G = loss_signal  [Phase 2]
+                                         w_degree      [warm-up]
+           Gate nodes: {v | G(v) >= quantile_q(G)}
+        2) Inside the gate, compute structural priority score:
            alpha = Var(w_boundary) / (Var(w_boundary) + Var(w_degree))
            beta  = Var(w_degree)   / (Var(w_boundary) + Var(w_degree))
            s_struct(v) = alpha * w_boundary(v) + beta * w_degree(v)
-           This replaces the hand-tuned boundary_weight=0.85 with a
-           principled, data-adaptive weighting that reflects which signal
-           is more informative on the given graph.
         3) Modulate gated nodes with uncertainty:
            FIW(v) ∝ s_struct(v) * (1 + fips_lam * U(v))
 
-    For backward compatibility, the argument name `sbrs_quantile` is retained,
-    but it is now used as the boundary-gating quantile.
+    Graph regime detection:
+        boundary_ratio ≥ 0.9 (saturated): w_boundary 변별력 붕괴
+            → loss_signal / w_degree 기반 gating으로 전환
+        homophily < 0.5 (heterophilic): w_boundary 단독 신호 부정확
+            → w_boundary + loss_signal 혼합
+        그 외: w_boundary 기반 gating (기본)
     """
     N      = data.x.size(0)
     device = data.x.device
@@ -311,21 +316,45 @@ def compute_fiw_weights(
     w_boundary = sig["w_boundary"]
     w_lhd      = sig["w_lhd"]  # diagnostics only
 
-    # ── 2순위 개선: Homophily-adaptive gating ────────────────────────────
-    # 이질성이 강한 그래프에서는 w_boundary 단독 게이팅이 실제 불공정 위험을
-    # 잘못 표현할 수 있다. Homophily ratio를 측정해서 낮으면(이질적 그래프)
-    # per-node loss × inter-group 노출을 추가 신호로 혼합한다.
-    homophily = _compute_edge_homophily(data)
-    is_heterophilic = homophily < _LOW_HOMOPHILY_THR
+    # ── 2순위 개선: Graph-regime-adaptive gating ──────────────────────────
+    # 그래프 구조 특성에 따라 gating 신호를 적응적으로 결정한다.
+    #
+    # [heterophilic]  homophily < 0.5:
+    #     w_boundary가 실제 불공정 위험을 잘못 표현할 수 있음.
+    #     per-node loss × inter-group 노출 신호를 혼합하여 보완.
+    #
+    # [saturated]  boundary_ratio ≥ 0.9:
+    #     거의 모든 노드가 경계에 있어 w_boundary의 변별력이 붕괴됨.
+    #     → Phase 2: loss_signal 기반으로 전환 (실제 예측 오류가 큰 노드 우선)
+    #     → warm-up: w_degree 기반 fallback (degree 불균형이 구조적 대리 신호)
+    #
+    # [그 외]:  w_boundary 그대로 사용.
+    homophily      = _compute_edge_homophily(data)
+    boundary_ratio = _compute_graph_stats(data)["boundary_ratio"]
 
-    if is_heterophilic and model is not None:
+    is_heterophilic = homophily < _LOW_HOMOPHILY_THR
+    is_saturated    = boundary_ratio >= boundary_sat_thr
+
+    if is_saturated:
+        # w_boundary 변별력 붕괴 → w_lhd 혼합으로 국소 이질 노드 타겟팅
+        # [Loveland et al. 2022, 2025]: globally homophilous 그래프에서
+        # local homophily deviation이 큰 노드가 가장 공정성 위험이 높음
+        mix = float(min(
+            (boundary_ratio - boundary_sat_thr) / (1.0 - boundary_sat_thr + 1e-8),
+            1.0
+        ))
+        gating_signal = _minmax((1.0 - mix) * w_boundary + mix * w_lhd)
+        gating_mode   = "saturated_lhd"
+    elif is_heterophilic and model is not None:
         loss_signal = _compute_loss_based_signal(model, data)
         # 혼합 비율: homophily가 낮을수록 loss_signal 비중 증가
         mix = 1.0 - homophily / _LOW_HOMOPHILY_THR   # ∈ (0, 1]
         gating_signal = (1.0 - mix) * w_boundary + mix * loss_signal
         gating_signal = _minmax(gating_signal)
+        gating_mode   = "heterophilic"
     else:
         gating_signal = w_boundary
+        gating_mode   = "boundary"
     # ─────────────────────────────────────────────────────────────────────
 
     boundary_threshold = float(torch.quantile(gating_signal, sbrs_quantile).item())
@@ -393,7 +422,7 @@ def compute_fiw_weights(
             n_total=N,
             uncertainty_type="none",
             homophily=round(homophily, 4),
-            gating_mode="heterophilic" if is_heterophilic else "boundary",
+            gating_mode=gating_mode,
             w_boundary_mean=float(w_boundary.mean().item()),
             w_degree_mean=float(w_degree.mean().item()),
             w_lhd_mean=float(w_lhd.mean().item()),
@@ -416,7 +445,7 @@ def compute_fiw_weights(
         n_total=N,
         uncertainty_type=uncertainty_type,
         homophily=round(homophily, 4),
-        gating_mode="heterophilic" if is_heterophilic else "boundary",
+        gating_mode=gating_mode,
         w_boundary_mean=float(w_boundary.mean().item()),
         w_degree_mean=float(w_degree.mean().item()),
         w_lhd_mean=float(w_lhd.mean().item()),
@@ -742,6 +771,8 @@ class FairGate:
         recal_interval   = _RECAL_INTERVAL,
         alpha_beta_mode  : str = "variance",   # ablation용 (3번 한계)
         edge_intervention: str = "drop",       # bridge 보존 옵션 (4번 한계)
+        ablation_mode    : str = "full_loss",  # none/struct_only/struct_rep/struct_out/rep_out/full_loss
+        boundary_sat_thr : float = 0.9,        # τ: r_bnd >= τ 이면 w_lhd 혼합 시작
     ):
         assert backbone in ("GCN", "GraphSAGE", "SGC"), \
             f"Unsupported backbone: {backbone}"
@@ -749,6 +780,8 @@ class FairGate:
             f"alpha_beta_mode must be variance/mutual_info/uniform, got: {alpha_beta_mode}"
         assert edge_intervention in ("drop", "scale"), \
             f"edge_intervention must be 'drop' or 'scale', got: {edge_intervention}"
+        assert ablation_mode in ("none", "struct_only", "struct_rep", "struct_out", "rep_out", "full_loss"), \
+            f"ablation_mode must be none/struct_only/struct_rep/struct_out/rep_out/full_loss, got: {ablation_mode}"
 
         self.device            = device
         self.backbone_name     = backbone
@@ -764,6 +797,8 @@ class FairGate:
         self.recal_interval    = recal_interval
         self.alpha_beta_mode   = alpha_beta_mode
         self.edge_intervention = edge_intervention
+        self.ablation_mode     = ablation_mode
+        self.boundary_sat_thr  = boundary_sat_thr
 
         self.name = f"{backbone}/FairGate"
 
@@ -784,6 +819,7 @@ class FairGate:
             sbrs_quantile=self.sbrs_quantile,
             fips_lam=self.fips_lam,
             uncertainty_type=self.uncertainty_type,
+            boundary_sat_thr=self.boundary_sat_thr,
         )
         _log_fiw(self.name, "Phase 1 (structure-only)", meta, self._node_w)
 
@@ -794,6 +830,7 @@ class FairGate:
             sbrs_quantile=self.sbrs_quantile,
             fips_lam=self.fips_lam,
             uncertainty_type=self.uncertainty_type,
+            boundary_sat_thr=self.boundary_sat_thr,
         )
         _log_fiw(self.name, "Phase 2 (hierarchical FIW)", meta, self._node_w)
 
@@ -804,6 +841,7 @@ class FairGate:
             sbrs_quantile=self.sbrs_quantile,
             fips_lam=self.fips_lam,
             uncertainty_type=self.uncertainty_type,
+            boundary_sat_thr=self.boundary_sat_thr,
         )
         if torch.isnan(new_w).any():
             print(f"[{self.name}] [Refresh@{epoch}] NaN detected — skipping update")
@@ -866,13 +904,19 @@ class FairGate:
         struct_loss = rep_loss = out_loss = task_loss.new_tensor(0.0)
 
         if lam > 0.0:
-            struct_loss = compute_structural_loss(
-                self.model, data, self._node_w, self.struct_drop,
-                edge_intervention=self.edge_intervention)
-            rep_loss    = self._rep_loss(h, sens, self._node_w, idx_fair)
-            out_loss    = compute_output_loss(
-                torch.sigmoid(out), labels, sens,
-                self._node_w, idx_fair, self.dp_eo_ratio)
+            use_struct = self.ablation_mode in ("struct_only", "struct_rep", "struct_out", "full_loss")
+            use_rep    = self.ablation_mode in ("struct_rep", "rep_out", "full_loss")
+            use_out    = self.ablation_mode in ("struct_out", "rep_out", "full_loss")
+            if use_struct:
+                struct_loss = compute_structural_loss(
+                    self.model, data, self._node_w, self.struct_drop,
+                    edge_intervention=self.edge_intervention)
+            if use_rep:
+                rep_loss    = self._rep_loss(h, sens, self._node_w, idx_fair)
+            if use_out:
+                out_loss    = compute_output_loss(
+                    torch.sigmoid(out), labels, sens,
+                    self._node_w, idx_fair, self.dp_eo_ratio)
 
         total = task_loss + lam * (
             self._scales["struct"] * struct_loss
@@ -933,7 +977,11 @@ class FairGate:
         if verbose:
             print(f"[{self.name}] Updating FIW weights & calibrating scales...")
         self._update_weights_fiw(data)
-        self._calibrate_scales(data, criterion)
+        if self.recal_interval > 0:
+            self._calibrate_scales(data, criterion)
+        else:
+            if verbose:
+                print(f"[{self.name}] Scale calibration disabled (recal_interval=0)")
         self.model.train()
 
         # Phase 2
@@ -954,7 +1002,9 @@ class FairGate:
             # warm-up 직후 단 한 번의 보정이 아니라, Phase 2 전반에 걸쳐
             # recal_interval 마다 손실 간 상대 비율을 재조정한다.
             # FIW 갱신과 인터리빙하여 오버헤드를 분산시킨다.
-            if epoch > 0 and epoch % self.recal_interval == 0:
+            if (self.recal_interval > 0
+                    and epoch > 0
+                    and epoch % self.recal_interval == 0):
                 if verbose:
                     print(f"[{self.name}] Periodic recalibration @ "
                           f"epoch {epoch + self.warm_up + 1}...")

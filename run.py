@@ -4,7 +4,7 @@ run.py — FairGate + 비교 모델 전체 실험 실행기
 실행:
     python run.py --run_name exp --mode all
     python run.py --run_name exp_baselines --mode baselines --models FairGT
-    python run.py --run_name exp_fairgate_v2 --mode fairgate --datasets pokec_z pokec_n pokec_z_g pokec_n_g
+    python run.py --run_name exp_fairgate_v3 --mode fairgate --datasets pokec_z pokec_n pokec_z_g pokec_n_g
     python run.py --run_name exp_v2 --datasets pokec_n recidivism
     python run.py --run_name exp_baselines --mode baselines --models NIFTY FairGB FairGNN EDITS FairEdit --datasets income
     python run.py --run_name exp_v2 --dry_run
@@ -14,7 +14,9 @@ run.py — FairGate + 비교 모델 전체 실험 실행기
 """
 
 # # 기본
-# python run.py --run_name exp_fairgate_v5 --mode fairgate
+# python run.py --run_name exp_fairgate_v2 --mode fairgate --datasets pokec_z_g pokec_n_g german
+# python run.py --run_name exp_fairgate_sage --mode fairgate --backbone GraphSAGE
+# python run.py --run_name exp_fairgate_sgc --mode fairgate --backbone SGC
 
 # # 3번 한계 ablation
 # python train.py --dataset pokec_z --backbone GCN --alpha_beta_mode mutual_info
@@ -35,95 +37,42 @@ DEVICE = 'cuda:1'
 COMMON_TRAIN = {
     "lr":           1e-3,
     "weight_decay": 1e-5,
-    "epochs":       1000,
-    "patience":     100,
+    "epochs":       500,
+    "patience":     501,
     "seed":         27,
     "runs":         5,
 }
 
 # ── FairGate 데이터셋별 하이퍼파라미터 ───────────────────────────────────
+# FAIRGATE_CONFIGS = {
+#     "pokec_z":    dict(lambda_fair=0.05, sbrs_quantile=0.7, struct_drop=0.5, warm_up=200),
+#     "pokec_n":    dict(lambda_fair=0.20, sbrs_quantile=0.7, struct_drop=0.5, warm_up=400),
+#     "pokec_n_g": dict(lambda_fair=0.01, sbrs_quantile=0.8, struct_drop=0.5, warm_up=400),  # 변경
+#     "pokec_z_g": dict(lambda_fair=0.20, sbrs_quantile=0.6, struct_drop=0.5, warm_up=100),  # 변경
+#     # "german":    dict(lambda_fair=0.20, sbrs_quantile=0.9, struct_drop=0.2, warm_up=100),  # 변경
+#     "german":     dict(lambda_fair=0.15, sbrs_quantile=0.7, struct_drop=0.3, warm_up=100),
+#     "credit":     dict(lambda_fair=0.10, sbrs_quantile=0.8, struct_drop=0.2, warm_up=100),
+#     "income":     dict(lambda_fair=0.20, sbrs_quantile=0.5, struct_drop=0.7, warm_up=200),
+#     "nba":       dict(lambda_fair=0.15, sbrs_quantile=0.8, struct_drop=0.2, warm_up=200),  # 유지
+#     "recidivism": dict(lambda_fair=0.07, sbrs_quantile=0.7, struct_drop=0.3, warm_up=100),
+
+# }
+
+# 수정본
 FAIRGATE_CONFIGS = {
-    "pokec_z": {
-        "lambda_fair":   0.05,
-        "sbrs_quantile": 0.7,
-        "fips_lam":      1.0,
-        "mmd_alpha":     0.3,
-        "struct_drop":   0.5,
-        "warm_up":       200,
-    },
-
-    "pokec_z_g": {
-        "lambda_fair":   0.05,
-        "sbrs_quantile": 0.7,
-        "fips_lam":      1.0,
-        "mmd_alpha":     0.3,
-        "struct_drop":   0.5,
-        "warm_up":       200,
-    },
-    
-    "pokec_n": {
-        "lambda_fair":   0.05,
-        "sbrs_quantile": 0.7,
-        "fips_lam":      1.0,
-        "mmd_alpha":     0.3,
-        "struct_drop":   0.5,
-        "warm_up":       200,
-    },
-
-    "pokec_n_g": {
-        "lambda_fair":   0.05,
-        "sbrs_quantile": 0.7,
-        "fips_lam":      1.0,
-        "mmd_alpha":     0.3,
-        "struct_drop":   0.5,
-        "warm_up":       200,
-    },
-
-    "german": {
-        "lambda_fair":   0.1,
-        "sbrs_quantile": 0.7,
-        "fips_lam":      1.0,
-        "mmd_alpha":     0.3,
-        "struct_drop":   0.5,
-        "warm_up":       200,
-    },
-
-    "credit": {
-        "lambda_fair":   0.06, # 0.07
-        "sbrs_quantile": 0.7,
-        "fips_lam":      1.0,
-        "mmd_alpha":     0.3,
-        "struct_drop":   0.5,
-        "warm_up":       200,
-    },
-    
-    "recidivism": {
-        "lambda_fair":   0.05,
-        "sbrs_quantile": 0.7,  
-        "fips_lam":      1.0,  
-        "mmd_alpha":     0.3,
-        "struct_drop":   0.3,
-        "warm_up":       200,
-    },
-
-    "nba": {
-        "lambda_fair":   0.08,
-        "sbrs_quantile": 0.7,
-        "fips_lam":      1.0,
-        "mmd_alpha":     0.3,
-        "struct_drop":   0.5,
-        "warm_up":       200,
-    },
-
-    "income": {
-        "lambda_fair":   0.05,
-        "sbrs_quantile": 0.7,
-        "fips_lam":      1.0,
-        "mmd_alpha":     0.3,
-        "struct_drop":   0.5,
-        "warm_up":       200,
-    },
+    # ── Pokec 계열 ──────────────────────────────────────────────────────────
+    "pokec_z":    dict(lambda_fair=0.10, sbrs_quantile=0.9, struct_drop=0.5, warm_up=400),
+    "pokec_z_g":  dict(lambda_fair=0.20, sbrs_quantile=0.9, struct_drop=0.5, warm_up=100),
+    "pokec_n":    dict(lambda_fair=0.15, sbrs_quantile=0.5, struct_drop=0.5, warm_up=400),
+    "pokec_n_g":  dict(lambda_fair=0.10, sbrs_quantile=0.9, struct_drop=0.5, warm_up=400),
+    # ── 소규모 그래프 ────────────────────────────────────────────────────────
+    "credit":     dict(lambda_fair=0.20, sbrs_quantile=0.5, struct_drop=0.7, warm_up=200),
+    "recidivism": dict(lambda_fair=0.10, sbrs_quantile=0.9, struct_drop=0.2, warm_up=100),
+    "income":     dict(lambda_fair=0.20, sbrs_quantile=0.5, struct_drop=0.7, warm_up=200),
+    "german":     dict(lambda_fair=0.20, sbrs_quantile=0.7, struct_drop=0.2, warm_up=100),
+    "nba":        dict(lambda_fair=0.40, sbrs_quantile=0.5, struct_drop=0.3, warm_up=200),
 }
+
 
 # ── 비교 모델 목록 ────────────────────────────────────────────────────────
 ALL_DATASETS = [
@@ -146,7 +95,7 @@ BASELINE_MODELS = [
 
 def build_fairgate_cmd(dataset: str, backbone: str, run_name: str) -> list:
     cfg = FAIRGATE_CONFIGS.get(dataset, FAIRGATE_CONFIGS["pokec_z"])
-    cmd = [sys.executable, "train.py",
+    cmd = [sys.executable, "-m", "utils.train",
            "--dataset",  dataset,
            "--backbone", backbone,
            "--device",   DEVICE,
@@ -158,7 +107,7 @@ def build_fairgate_cmd(dataset: str, backbone: str, run_name: str) -> list:
 
 
 def build_baseline_cmd(model: str, dataset: str, run_name: str) -> list:
-    cmd = [sys.executable, "train_baselines.py",
+    cmd = [sys.executable, "-m", "utils.train_baselines",
            "--model",      model,
            "--dataset",    dataset,
            "--device",     DEVICE,
@@ -215,8 +164,8 @@ def run_all(args):
 
     # ── OOM 조합: 실행 자체를 건너뜀 ────────────────────────────
     OOM_SKIP = {
-        "EDITS":    {"pokec_z", "pokec_n"},
-        "FairEdit": {"pokec_z", "pokec_n"},
+        # "EDITS":    {"pokec_z", "pokec_n"},
+        # "FairEdit": {"pokec_z", "pokec_n"},
     }
 
     # ── 비교 모델 ─────────────────────────────────────────────

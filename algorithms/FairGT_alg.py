@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from scipy.sparse.linalg import eigsh
 from sklearn.metrics import accuracy_score, roc_auc_score, f1_score
 
-from FairGT.model import FairGT as _FairGTModel
+from algorithms.FairGT.model import FairGT as _FairGTModel
 
 
 # ============================================================
@@ -80,7 +80,7 @@ def _pyg_data_to_scipy_adj(data):
     return adj
 
 
-def _get_same_sens_complete_graph(adj_scipy, sens_tensor, dataset_name, cache_dir='./adj_files'):
+def _get_same_sens_complete_graph(adj_scipy, sens_tensor, dataset_name, cache_dir='./algorithms/adj_files'):
     """
     원본 get_same_sens_complete_graph — 동일 sens끼리 완전 연결 그래프 생성.
     dgl 없이 순수 scipy/torch로 구현. 캐시 파일 사용.
