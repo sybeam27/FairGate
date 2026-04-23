@@ -25,21 +25,22 @@ train.py에 --log_training 플래그 사용.
 import os, sys, argparse, subprocess
 import pandas as pd
 
-DEVICE = "cuda:1"
+DEVICE = "cuda:0"
 
 DEFAULT_DATASETS = ["pokec_z", "german", "nba", "credit", "recidivism"]
 
 FAIRGATE_CONFIGS = {
-    "pokec_z":    dict(lambda_fair=0.05, sbrs_quantile=0.7, struct_drop=0.5, warm_up=200),
-    "pokec_n":    dict(lambda_fair=0.20, sbrs_quantile=0.7, struct_drop=0.5, warm_up=400),
-    "pokec_n_g": dict(lambda_fair=0.01, sbrs_quantile=0.8, struct_drop=0.5, warm_up=400),  # 변경
-    "pokec_z_g": dict(lambda_fair=0.20, sbrs_quantile=0.6, struct_drop=0.5, warm_up=100),  # 변경
-    # "german":    dict(lambda_fair=0.20, sbrs_quantile=0.9, struct_drop=0.2, warm_up=100),  # 변경
-    "german":     dict(lambda_fair=0.15, sbrs_quantile=0.7, struct_drop=0.3, warm_up=100),
-    "credit":     dict(lambda_fair=0.10, sbrs_quantile=0.8, struct_drop=0.2, warm_up=100),
+    # ── Pokec 계열 ──────────────────────────────────────────────────────────
+    "pokec_z":    dict(lambda_fair=0.10, sbrs_quantile=0.9, struct_drop=0.5, warm_up=400),
+    "pokec_z_g":  dict(lambda_fair=0.20, sbrs_quantile=0.9, struct_drop=0.5, warm_up=100),
+    "pokec_n":    dict(lambda_fair=0.15, sbrs_quantile=0.5, struct_drop=0.5, warm_up=400),
+    "pokec_n_g":  dict(lambda_fair=0.01, sbrs_quantile=0.8, struct_drop=0.5, warm_up=400),
+    # ── 소규모 그래프 ────────────────────────────────────────────────────────
+    "credit":     dict(lambda_fair=0.20, sbrs_quantile=0.5, struct_drop=0.7, warm_up=200),
+    "recidivism": dict(lambda_fair=0.10, sbrs_quantile=0.9, struct_drop=0.2, warm_up=100),
     "income":     dict(lambda_fair=0.20, sbrs_quantile=0.5, struct_drop=0.7, warm_up=200),
-    "nba":       dict(lambda_fair=0.15, sbrs_quantile=0.8, struct_drop=0.2, warm_up=200),  # 유지
-    "recidivism": dict(lambda_fair=0.07, sbrs_quantile=0.7, struct_drop=0.3, warm_up=100),
+    "german":     dict(lambda_fair=0.20, sbrs_quantile=0.95, struct_drop=0.2, warm_up=100),
+    "nba":        dict(lambda_fair=0.40, sbrs_quantile=0.5, struct_drop=0.3, warm_up=200),
 }
 
 FIXED = dict(

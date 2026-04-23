@@ -6,6 +6,7 @@ import os
 import time
 import random
 import argparse
+import tracemalloc
 from datetime import datetime
 
 import numpy as np
@@ -21,6 +22,71 @@ def set_seed(seed: int = 42):
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
+
+# ============================================================
+# Scalability 측정 유틸리티
+# ============================================================
+
+def count_params(model) -> int:
+    """학습 가능한 파라미터 수 반환."""
+    try:
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    except (AttributeError, TypeError):
+        return 0
+
+
+def get_graph_stats_pyg(data) -> dict:
+    """PyG Data 객체 → {n_nodes, n_edges, avg_degree} 반환."""
+    n_nodes = int(data.x.size(0))
+    n_edges = int(data.edge_index.size(1))
+    avg_deg = round(n_edges / n_nodes, 2) if n_nodes > 0 else 0.0
+    return {"n_nodes": n_nodes, "n_edges": n_edges, "avg_degree": avg_deg}
+
+
+def _infer_epochs_run(model, fallback: int) -> int:
+    """
+    모델 속성에서 실제 수행된 에폭 수를 추론.
+    early stopping이 있는 모델은 best_epoch / epochs_trained 속성으로 확인.
+    없으면 fallback(=args.epochs) 사용.
+    """
+    for attr in ("epochs_trained_", "best_epoch_", "best_epoch",
+                 "epochs_trained", "n_iter_", "num_epochs"):
+        val = getattr(model, attr, None)
+        if val is not None and isinstance(val, (int, float)) and val > 0:
+            return int(val)
+    return fallback
+
+
+class MemTracker:
+    """
+    GPU(CUDA) 또는 CPU 메모리 피크 측정 컨텍스트.
+
+    Usage::
+        tracker = MemTracker(device)
+        tracker.start()
+        ... heavy computation ...
+        peak_mb = tracker.stop()
+    """
+    def __init__(self, device: str):
+        self._use_cuda = "cuda" in str(device) and torch.cuda.is_available()
+
+    def start(self):
+        if self._use_cuda:
+            torch.cuda.reset_peak_memory_stats()
+        else:
+            if tracemalloc.is_tracing():
+                tracemalloc.stop()
+            tracemalloc.start()
+
+    def stop(self) -> float:
+        if self._use_cuda:
+            peak = torch.cuda.max_memory_allocated() / 1024 ** 2
+        else:
+            _, peak_bytes = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            peak = peak_bytes / 1024 ** 2
+        return round(peak, 1)
 
 
 def _resolve_save_path(args) -> str:
@@ -95,7 +161,16 @@ def save_summary(summary: pd.DataFrame, args: argparse.Namespace):
                 "f1_mean", "f1_std",
                 "dp_mean", "dp_std",
                 "eo_mean", "eo_std",
-                "time_sec_mean", "time_sec_std"]
+                "time_sec_mean", "time_sec_std",
+                # ── Scalability 지표 ─────────────────────────
+                "n_nodes_mean",
+                "n_edges_mean",
+                "avg_degree_mean",
+                "n_params_mean",
+                "peak_mem_mb_mean", "peak_mem_mb_std",
+                "epochs_run_mean",  "epochs_run_std",
+                "time_per_epoch_ms_mean", "time_per_epoch_ms_std",
+                ]
     ordered  = [c for c in priority if c in final.columns]
     rest     = [c for c in final.columns if c not in ordered]
     final    = final[ordered + rest]
@@ -176,6 +251,9 @@ def run_experiment(data, args):
         boundary_sat_thr = args.boundary_sat_thr,
     )
 
+    # ── Scalability: 파라미터 수 ──────────────────────────────────────────
+    n_params = count_params(model)
+
     # ablation_mode=struct_only일 때 out_loss를 0으로 만들기 위해
     # model의 _train_step을 monkey-patch
     if ablation_mode == "struct_only":
@@ -194,6 +272,7 @@ def run_experiment(data, args):
         # struct_only는 mmd_alpha=0으로 rep=0, out만 남음
         # out도 끄려면 lambda_fair를 조정하는 것이 더 안전 → 현재 구조 유지
 
+    t_fit = time.time()
     model.fit(
         data,
         epochs       = args.epochs,
@@ -202,6 +281,14 @@ def run_experiment(data, args):
         patience     = args.patience,
         verbose      = True,
     )
+    fit_sec = time.time() - t_fit
+
+    # ── Scalability: 에폭 효율 ────────────────────────────────────────────
+    epochs_run        = _infer_epochs_run(model, fallback=args.epochs)
+    time_per_epoch_ms = round(fit_sec * 1000 / epochs_run, 2) if epochs_run > 0 else float("nan")
+
+    # ── 그래프 통계 ───────────────────────────────────────────────────────
+    graph_stats = get_graph_stats_pyg(data)
 
     result = model.evaluate(data, split="test")
 
@@ -218,7 +305,15 @@ def run_experiment(data, args):
     if getattr(args, "sensitivity_param", None): tag_cols["sensitivity_param"] = args.sensitivity_param
     if getattr(args, "sensitivity_value", None): tag_cols["sensitivity_value"] = float(args.sensitivity_value)
 
-    return pd.DataFrame([{**tag_cols, **result}])
+    # ── Scalability 메트릭 병합 (peak_mem_mb는 외부 루프에서 채워 넣음) ──
+    scale_cols = {
+        **graph_stats,
+        "n_params"          : n_params,
+        "epochs_run"        : epochs_run,
+        "time_per_epoch_ms" : time_per_epoch_ms,
+    }
+
+    return pd.DataFrame([{**tag_cols, **result, **scale_cols}])
 
 
 def parse_args():
@@ -321,6 +416,7 @@ if __name__ == "__main__":
           f"nodes={data.x.size(0)}")
 
     all_results = []
+    mem_tracker = MemTracker(args.device)
     for run in range(args.runs):
         print(f"\n{'─'*70}")
         print(f"Run {run + 1}/{args.runs}")
@@ -329,10 +425,14 @@ if __name__ == "__main__":
         run_args      = argparse.Namespace(**vars(args))
         run_args.seed = args.seed + run
 
-        t0             = time.time()
-        df             = run_experiment(data, run_args)
-        df["run"]      = run + 1
-        df["time_sec"] = round(time.time() - t0, 1)
+        t0 = time.time()
+        mem_tracker.start()
+        df = run_experiment(data, run_args)
+        peak_mem = mem_tracker.stop()
+
+        df["run"]          = run + 1
+        df["time_sec"]     = round(time.time() - t0, 1)
+        df["peak_mem_mb"]  = peak_mem   # MemTracker가 외부에서 채워 넣음
         all_results.append(df)
 
     final_df = pd.concat(all_results, ignore_index=True)
@@ -364,5 +464,20 @@ if __name__ == "__main__":
     if "time_sec_mean" in summary.columns:
         print(f"  {'time(s)':8s}: {summary['time_sec_mean'].values[0]:.1f} "
               f"± {summary['time_sec_std'].values[0]:.1f}")
+    # ── Scalability 요약 출력 ─────────────────────────────────────────────
+    scale_print = [
+        ("n_nodes",           "nodes",        ".0f"),
+        ("n_edges",           "edges",        ".0f"),
+        ("avg_degree",        "avg_degree",   ".2f"),
+        ("n_params",          "n_params",     ".0f"),
+        ("peak_mem_mb",       "peak_mem(MB)", ".1f"),
+        ("epochs_run",        "epochs_run",   ".1f"),
+        ("time_per_epoch_ms", "ms/epoch",     ".2f"),
+    ]
+    for key, label, fmt in scale_print:
+        mu_col = f"{key}_mean"
+        if mu_col in summary.columns and not pd.isna(summary[mu_col].values[0]):
+            val = summary[mu_col].values[0]
+            print(f"  {label:14s}: {val:{fmt}}")
 
     save_summary(summary, args)

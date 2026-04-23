@@ -18,6 +18,7 @@ import json
 import time
 import random
 import argparse
+import tracemalloc
 from datetime import datetime
 
 import numpy as np
@@ -43,12 +44,23 @@ from algorithms.NIFTY    import NIFTY
 from algorithms.FairGB_alg   import FairGB
 from algorithms.FairGT_alg   import FairGT
 
-# ── 메트릭 컬럼명 (train.py와 동일한 순서) ───────────────────────────────
+# ── 성능 메트릭 컬럼명 (train.py와 동일한 순서) ─────────────────────────
 METRIC_NAMES = [
     "acc", "roc_auc", "f1",
     "acc_sens0", "roc_auc_sens0", "f1_sens0",
     "acc_sens1", "roc_auc_sens1", "f1_sens1",
     "dp", "eo",
+]
+
+# ── Scalability 분석 메트릭 컬럼명 ──────────────────────────────────────
+SCALE_METRIC_NAMES = [
+    "n_nodes",            # 그래프 노드 수
+    "n_edges",            # 그래프 엣지 수 (nnz of adj)
+    "avg_degree",         # 평균 차수
+    "n_params",           # 학습 가능한 파라미터 수
+    "peak_mem_mb",        # 학습 중 최대 메모리 사용량 (MB)
+    "epochs_run",         # 실제 수행된 에폭 수 (early stopping 반영)
+    "time_per_epoch_ms",  # 에폭당 평균 학습 시간 (ms)
 ]
 
 
@@ -64,6 +76,93 @@ def setup_seed(seed: int):
     random.seed(seed)
 
 
+# ============================================================
+# Scalability 측정 유틸리티
+# ============================================================
+
+def count_params(model) -> int:
+    """학습 가능한 파라미터 수 반환. parameters() 미지원 모델은 0."""
+    try:
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+    except (AttributeError, TypeError):
+        return 0
+
+
+def get_graph_stats_adj(adj) -> dict:
+    """
+    adj → 그래프 통계 dict 반환.
+    scipy sparse matrix, torch sparse tensor, dense torch tensor 모두 지원.
+    """
+    import torch as _torch
+    n_nodes = int(adj.shape[0])
+
+    if hasattr(adj, "nnz"):                        # scipy sparse
+        n_edges = int(adj.nnz)
+    elif isinstance(adj, _torch.Tensor):
+        if adj.is_sparse:                          # torch sparse tensor
+            n_edges = int(adj._nnz())
+        else:                                      # dense torch tensor
+            n_edges = int((adj != 0).sum().item())
+    else:
+        n_edges = 0                                # fallback
+
+    avg_deg = round(n_edges / n_nodes, 2) if n_nodes > 0 else 0.0
+    return {"n_nodes": n_nodes, "n_edges": n_edges, "avg_degree": avg_deg}
+
+
+def get_graph_stats_pyg(data) -> dict:
+    """PyG Data 객체 → 그래프 통계 dict 반환."""
+    n_nodes  = int(data.x.size(0))
+    n_edges  = int(data.edge_index.size(1))
+    avg_deg  = round(n_edges / n_nodes, 2) if n_nodes > 0 else 0.0
+    return {"n_nodes": n_nodes, "n_edges": n_edges, "avg_degree": avg_deg}
+
+
+def _infer_epochs_run(model, fallback: int) -> int:
+    """
+    모델 속성에서 실제 수행된 에폭 수를 추론.
+    early stopping이 있는 모델은 best_epoch / epochs_trained 속성을 통해 확인.
+    없으면 fallback(=args.epochs) 사용.
+    """
+    for attr in ("epochs_trained_", "best_epoch_", "best_epoch",
+                 "epochs_trained", "n_iter_", "num_epochs"):
+        val = getattr(model, attr, None)
+        if val is not None and isinstance(val, (int, float)) and val > 0:
+            return int(val)
+    return fallback
+
+
+class MemTracker:
+    """
+    GPU(CUDA) 또는 CPU 메모리 피크 측정 컨텍스트.
+
+    Usage::
+        tracker = MemTracker(device)
+        tracker.start()
+        ... heavy computation ...
+        peak_mb = tracker.stop()
+    """
+    def __init__(self, device: str):
+        self._use_cuda = "cuda" in str(device) and torch.cuda.is_available()
+
+    def start(self):
+        if self._use_cuda:
+            torch.cuda.reset_peak_memory_stats()
+        else:
+            if tracemalloc.is_tracing():
+                tracemalloc.stop()
+            tracemalloc.start()
+
+    def stop(self) -> float:
+        if self._use_cuda:
+            peak = torch.cuda.max_memory_allocated() / 1024 ** 2
+        else:
+            _, peak_bytes = tracemalloc.get_traced_memory()
+            tracemalloc.stop()
+            peak = peak_bytes / 1024 ** 2
+        return round(peak, 1)
+
+
 def to_device(adj, feats, labels, idx_train, idx_val, idx_test, sens, device):
     return (
         adj.to(device), feats.to(device), labels.to(device),
@@ -75,6 +174,27 @@ def to_device(adj, feats, labels, idx_train, idx_val, idx_test, sens, device):
 def pack_result(values) -> dict:
     """모델 predict()의 11개 반환값 → 컬럼명 dict"""
     return {k: float(v) for k, v in zip(METRIC_NAMES, values)}
+
+
+def pack_scale(graph_stats: dict, model, epochs_run: int, fit_sec: float) -> dict:
+    """
+    Scalability 지표를 하나의 dict로 묶어 반환.
+
+    Args:
+        graph_stats : get_graph_stats_adj / get_graph_stats_pyg 반환값
+        model       : fit() 완료된 모델 객체 (파라미터 수 계산용)
+        epochs_run  : 실제 수행된 에폭 수
+        fit_sec     : fit() 소요 시간(초, time_sec 전체가 아닌 fit만)
+    """
+    n_params = count_params(model)
+    time_per_epoch_ms = round(fit_sec * 1000 / epochs_run, 2) if epochs_run > 0 else float("nan")
+    return {
+        **graph_stats,
+        "n_params":           n_params,
+        "epochs_run":         epochs_run,
+        "time_per_epoch_ms":  time_per_epoch_ms,
+        # peak_mem_mb는 MemTracker가 외부에서 채워 넣음
+    }
 
 
 def _resolve_save_path(args) -> str:
@@ -131,7 +251,7 @@ def save_summary(all_results: list, args: argparse.Namespace):
 
     summary = pd.DataFrame([row])
 
-    # 열 순서: train.py와 동일
+    # 열 순서: train.py와 동일 + scalability 항목
     priority = [
         "dataset", "task", "model",
         "acc_mean", "acc_std",
@@ -140,6 +260,14 @@ def save_summary(all_results: list, args: argparse.Namespace):
         "dp_mean", "dp_std",
         "eo_mean", "eo_std",
         "time_sec_mean", "time_sec_std",
+        # ── Scalability 지표 ─────────────────────────
+        "n_nodes_mean",
+        "n_edges_mean",
+        "avg_degree_mean",
+        "n_params_mean",
+        "peak_mem_mb_mean", "peak_mem_mb_std",
+        "epochs_run_mean",  "epochs_run_std",
+        "time_per_epoch_ms_mean", "time_per_epoch_ms_std",
     ]
 
     dedup_keys = ["dataset", "task", "model"]
@@ -176,6 +304,21 @@ def save_summary(all_results: list, args: argparse.Namespace):
             print(f"    {col}: {summary[col].values[0]:.4f}")
     if "time_sec_mean" in summary.columns:
         print(f"    time_sec: {summary['time_sec_mean'].values[0]:.1f} ± {summary['time_sec_std'].values[0]:.1f}s")
+    # ── Scalability 요약 출력 ─────────────────────────────────────────────
+    scale_print = [
+        ("n_nodes",           "nodes",         ".0f"),
+        ("n_edges",           "edges",         ".0f"),
+        ("avg_degree",        "avg_degree",    ".2f"),
+        ("n_params",          "n_params",      ".0f"),
+        ("peak_mem_mb",       "peak_mem(MB)",  ".1f"),
+        ("epochs_run",        "epochs_run",    ".1f"),
+        ("time_per_epoch_ms", "ms/epoch",      ".2f"),
+    ]
+    for key, label, fmt in scale_print:
+        mu_col = f"{key}_mean"
+        if mu_col in summary.columns and not pd.isna(summary[mu_col].values[0]):
+            val = summary[mu_col].values[0]
+            print(f"    {label}: {val:{fmt}}")
 
 
 # ============================================================
@@ -184,7 +327,14 @@ def save_summary(all_results: list, args: argparse.Namespace):
 
 def run_model(args, param1, param2, seed: int) -> dict:
     """
-    단일 run 실행 → result dict 반환
+    단일 run 실행 → 성능 메트릭 + scalability 메트릭 dict 반환
+
+    반환 dict 추가 키:
+        n_nodes, n_edges, avg_degree  : 그래프 규모
+        n_params                      : 학습 가능한 파라미터 수
+        epochs_run                    : 실제 수행된 에폭 수
+        time_per_epoch_ms             : 에폭당 평균 학습 시간(ms)
+        (peak_mem_mb 는 외부 MemTracker가 채워 넣음)
 
     공통 학습 설정 적용 현황:
         GNN       : __init__에서 lr, weight_decay 직접 전달 / fit(epochs)
@@ -209,24 +359,37 @@ def run_model(args, param1, param2, seed: int) -> dict:
         # walk 기반 — 내부 embedding lr 고정, 외부 설정 미지원
         adj, feats, labels, idx_train, idx_val, idx_test, sens, sens_idx = load_data(
             dataset, feature_normalize=(dataset in ("nba", "german")))
+        graph_stats = get_graph_stats_adj(adj)
         model = CrossWalk()
+        t_fit = time.time()
         model.fit(adj, feats, labels, idx_train, sens, device=device,
                   number_walks=param1, walk_length=param2, window_size=5)
-        return pack_result(model.predict(idx_test))
+        fit_sec = time.time() - t_fit
+        # walk 기반: epoch 개념 없음 → param1(num_walks) 근사치 사용
+        epochs_run = _infer_epochs_run(model, fallback=int(param1))
+        return {**pack_result(model.predict(idx_test)),
+                **pack_scale(graph_stats, model, epochs_run, fit_sec)}
 
     elif model_name == "FairWalk":
         # walk 기반 — 내부 embedding lr 고정, 외부 설정 미지원
         adj, feats, labels, idx_train, idx_val, idx_test, sens, sens_idx = load_data(dataset)
+        graph_stats = get_graph_stats_adj(adj)
         model = FairWalk()
+        t_fit = time.time()
         model.fit(adj, labels, idx_train, sens, device=device,
                   num_walks=param1, walk_length=param2)
-        return pack_result(model.predict(idx_test, idx_val))
+        fit_sec = time.time() - t_fit
+        epochs_run = _infer_epochs_run(model, fallback=int(param1))
+        return {**pack_result(model.predict(idx_test, idx_val)),
+                **pack_scale(graph_stats, model, epochs_run, fit_sec)}
 
     elif model_name == "FairVGNN":
         # fit()에 c_lr, e_lr, c_wd, e_wd, epochs 파라미터 직접 지원
         adj, feats, labels, idx_train, idx_val, idx_test, sens, sens_idx = load_data(
             dataset, feature_normalize=(dataset == "german"))
+        graph_stats = get_graph_stats_adj(adj)
         model = FairVGNN()
+        t_fit = time.time()
         if dataset == "recidivism":
             model.fit(adj, feats, labels, idx_train, idx_val, idx_test, sens, sens_idx,
                       device=device, runs=1, seed=seed,
@@ -258,7 +421,10 @@ def run_model(args, param1, param2, seed: int) -> dict:
                       hidden=args.hidden_dim,
                       top_k=param1, alpha=param2,
                       epochs=epochs)
-        return pack_result(model.predict())
+        fit_sec = time.time() - t_fit
+        epochs_run = _infer_epochs_run(model, fallback=epochs)
+        return {**pack_result(model.predict()),
+                **pack_scale(graph_stats, model, epochs_run, fit_sec)}
 
     elif model_name == "FairGNN":
         # __init__ 내부 argparse에서 lr, weight_decay, epochs 설정
@@ -268,6 +434,7 @@ def run_model(args, param1, param2, seed: int) -> dict:
         }
         adj, feats, labels, idx_train, idx_val, idx_test, sens, sens_idx = load_data(
             dataset, feature_normalize=(dataset in ("nba", "german")))
+        graph_stats = get_graph_stats_adj(adj)
         adj, feats, labels, idx_train, idx_val, idx_test, sens = to_device(
             adj, feats, labels, idx_train, idx_val, idx_test, sens, device)
         temp_acc = temp_accs.get(dataset, 0.6) - 0.3
@@ -285,74 +452,108 @@ def run_model(args, param1, param2, seed: int) -> dict:
         ))
         model.optimizer_G = torch.optim.Adam(G_params, lr=lr, weight_decay=wd)
         model.optimizer_A = torch.optim.Adam(model.adv.parameters(), lr=lr, weight_decay=wd)
+        t_fit = time.time()
         model.fit(adj, feats, labels, idx_train, idx_val, idx_test, sens, idx_train,
                   device=device)
-        return pack_result(model.predict(idx_test))
+        fit_sec = time.time() - t_fit
+        epochs_run = _infer_epochs_run(model, fallback=epochs)
+        return {**pack_result(model.predict(idx_test)),
+                **pack_scale(graph_stats, model, epochs_run, fit_sec)}
 
     elif model_name == "FairEdit":
         # fit()에 lr, weight_decay, epochs 직접 지원
         adj, feats, labels, idx_train, idx_val, idx_test, sens, sens_idx = load_data(
             dataset, feature_normalize=(dataset == "german"))
+        graph_stats = get_graph_stats_adj(adj)
         model = FairEdit()
+        t_fit = time.time()
         model.fit(adj, feats, labels, idx_train, idx_val, idx_test, sens, sens_idx,
                   lr=lr, weight_decay=wd, epochs=epochs,
                   hidden=args.hidden_dim, dropout=0.2, device=device)
-        return pack_result(model.predict())
+        fit_sec = time.time() - t_fit
+        epochs_run = _infer_epochs_run(model, fallback=epochs)
+        return {**pack_result(model.predict()),
+                **pack_scale(graph_stats, model, epochs_run, fit_sec)}
 
     elif model_name == "EDITS":
         # __init__에서 lr, weight_decay / fit()에 epochs / predict()에 lr, weight_decay
         adj, feats, labels, idx_train, idx_val, idx_test, sens, sens_idx = load_data(
             dataset, feature_normalize=False)
+        graph_stats = get_graph_stats_adj(adj)
         if dataset in ("credit", "german"):
             feats = feats / feats.norm(dim=0)
         ep = 100 if dataset == "german" else min(500, epochs)
         model = EDITS(feats, dropout=param1, lr=lr, weight_decay=wd)
+        t_fit = time.time()
         model.fit(adj, feats, sens, idx_train, idx_val,
                   half=False, device=device, epochs=ep)
-        return pack_result(model.predict(
+        fit_sec = time.time() - t_fit
+        epochs_run = _infer_epochs_run(model, fallback=ep)
+        result = pack_result(model.predict(
             adj, labels, sens, idx_train, idx_val, idx_test,
             epochs=ep, lr=lr, weight_decay=wd,
             threshold_proportion=param2))
+        return {**result, **pack_scale(graph_stats, model, epochs_run, fit_sec)}
 
     elif model_name == "NIFTY":
         # num_hidden=encoder 출력 차원, num_proj_hidden=SSL projection head 차원
         adj, feats, labels, idx_train, idx_val, idx_test, sens, sens_idx = load_data(
             dataset, feature_normalize=False)
+        graph_stats = get_graph_stats_adj(adj)
         model = NIFTY(adj, feats, labels, idx_train, idx_val, idx_test, sens, sens_idx,
                       num_hidden=args.hidden_dim,
                       num_proj_hidden=args.proj_hidden_dim,
                       lr=lr, weight_decay=wd, device=device)
+        t_fit = time.time()
         model.fit(epochs=epochs)
-        return pack_result(model.predict())
+        fit_sec = time.time() - t_fit
+        epochs_run = _infer_epochs_run(model, fallback=epochs)
+        return {**pack_result(model.predict()),
+                **pack_scale(graph_stats, model, epochs_run, fit_sec)}
 
     elif model_name == "GNN":
         # num_hidden=encoder 출력 차원, num_proj_hidden=SSL projection head 차원
         adj, feats, labels, idx_train, idx_val, idx_test, sens, sens_idx = load_data(
             dataset, feature_normalize=False)
+        graph_stats = get_graph_stats_adj(adj)
         model = GNN(adj, feats, labels, idx_train, idx_val, idx_test, sens, sens_idx,
                     num_hidden=args.hidden_dim,
                     num_proj_hidden=args.proj_hidden_dim,
                     lr=lr, weight_decay=wd, device=device)
+        t_fit = time.time()
         model.fit(epochs=epochs)
-        return pack_result(model.predict())
+        fit_sec = time.time() - t_fit
+        epochs_run = _infer_epochs_run(model, fallback=epochs)
+        return {**pack_result(model.predict()),
+                **pack_scale(graph_stats, model, epochs_run, fit_sec)}
 
     elif model_name == "FairGB":
         # fit()에 c_lr, e_lr, c_wd, e_wd, epochs, hidden 직접 지원
         data, sens_idx, x_min, x_max = get_dataset(dataset)
+        graph_stats = get_graph_stats_pyg(data)
         data.sens_idx = sens_idx
         model = FairGB()
+        t_fit = time.time()
         model.fit(data, device=device, runs=1, seed=seed,
                   epochs=epochs, hidden=args.hidden_dim,
                   c_lr=lr, c_wd=wd,
                   e_lr=lr, e_wd=wd)
-        return pack_result(model.predict())
-    
+        fit_sec = time.time() - t_fit
+        epochs_run = _infer_epochs_run(model, fallback=epochs)
+        return {**pack_result(model.predict()),
+                **pack_scale(graph_stats, model, epochs_run, fit_sec)}
+
     elif model_name == "FairGT":
         data, sens_idx, _, _ = get_dataset(dataset)
+        graph_stats = get_graph_stats_pyg(data)
         model = FairGT(data, sens_idx, args, lr=lr, weight_decay=wd, device=device)
+        t_fit = time.time()
         model.fit(epochs=epochs, patience=args.patience)
-        return pack_result(model.predict())
-    
+        fit_sec = time.time() - t_fit
+        epochs_run = _infer_epochs_run(model, fallback=epochs)
+        return {**pack_result(model.predict()),
+                **pack_scale(graph_stats, model, epochs_run, fit_sec)}
+
     else:
         raise ValueError(f"Unknown model: {model_name}")
 
@@ -498,6 +699,7 @@ if __name__ == "__main__":
     print(f"{'='*65}\n")
 
     all_results = []
+    mem_tracker = MemTracker(args.device)
     for run in range(args.runs):
         print(f"\n{'─'*65}")
         print(f"  Run {run + 1}/{args.runs}")
@@ -506,13 +708,23 @@ if __name__ == "__main__":
         seed = args.seed + run
         t0   = time.time()
 
+        mem_tracker.start()
         result         = run_model(args, param1, param2, seed)
-        result["run"]  = run + 1
-        result["time_sec"] = round(time.time() - t0, 1)
+        peak_mem       = mem_tracker.stop()
+
+        result["run"]        = run + 1
+        result["time_sec"]   = round(time.time() - t0, 1)
+        result["peak_mem_mb"] = peak_mem  # MemTracker가 외부에서 채워 넣음
 
         print(f"  acc={result['acc']:.4f} | roc_auc={result['roc_auc']:.4f} | "
               f"f1={result['f1']:.4f} | dp={result['dp']:.4f} | "
               f"eo={result['eo']:.4f}  ({result['time_sec']:.1f}s)")
+        print(f"  [scale] nodes={result.get('n_nodes','?')} | "
+              f"edges={result.get('n_edges','?')} | "
+              f"params={result.get('n_params','?'):,} | "
+              f"mem={peak_mem:.1f}MB | "
+              f"epochs={result.get('epochs_run','?')} | "
+              f"{result.get('time_per_epoch_ms','?'):.2f}ms/ep")
         all_results.append(result)
 
     save_summary(all_results, args)

@@ -14,7 +14,10 @@ run.py — FairGate + 비교 모델 전체 실험 실행기
 """
 
 # # 기본
-# python run.py --run_name exp_fairgate_v2 --mode fairgate --datasets pokec_z_g pokec_n_g german
+# python run.py --run_name exp_fairgate_sc --mode fairgate
+# python run.py --run_name exp_baselines_sc --mode baselines
+
+# python run.py --run_name exp_fairgate_v2 --mode fairgate --datasets german
 # python run.py --run_name exp_fairgate_sage --mode fairgate --backbone GraphSAGE
 # python run.py --run_name exp_fairgate_sgc --mode fairgate --backbone SGC
 
@@ -31,7 +34,7 @@ import argparse
 from datetime import datetime
 
 
-DEVICE = 'cuda:1'
+DEVICE = 'cuda:0'
 
 # ── 공통 학습 설정 (train.py / train_baselines.py 동일) ──────────────────
 COMMON_TRAIN = {
@@ -40,7 +43,7 @@ COMMON_TRAIN = {
     "epochs":       500,
     "patience":     501,
     "seed":         27,
-    "runs":         5,
+    "runs":         10,
 }
 
 # ── FairGate 데이터셋별 하이퍼파라미터 ───────────────────────────────────
@@ -64,12 +67,12 @@ FAIRGATE_CONFIGS = {
     "pokec_z":    dict(lambda_fair=0.10, sbrs_quantile=0.9, struct_drop=0.5, warm_up=400),
     "pokec_z_g":  dict(lambda_fair=0.20, sbrs_quantile=0.9, struct_drop=0.5, warm_up=100),
     "pokec_n":    dict(lambda_fair=0.15, sbrs_quantile=0.5, struct_drop=0.5, warm_up=400),
-    "pokec_n_g":  dict(lambda_fair=0.10, sbrs_quantile=0.9, struct_drop=0.5, warm_up=400),
+    "pokec_n_g":  dict(lambda_fair=0.01, sbrs_quantile=0.8, struct_drop=0.5, warm_up=400),
     # ── 소규모 그래프 ────────────────────────────────────────────────────────
     "credit":     dict(lambda_fair=0.20, sbrs_quantile=0.5, struct_drop=0.7, warm_up=200),
     "recidivism": dict(lambda_fair=0.10, sbrs_quantile=0.9, struct_drop=0.2, warm_up=100),
     "income":     dict(lambda_fair=0.20, sbrs_quantile=0.5, struct_drop=0.7, warm_up=200),
-    "german":     dict(lambda_fair=0.20, sbrs_quantile=0.7, struct_drop=0.2, warm_up=100),
+    "german":     dict(lambda_fair=0.20, sbrs_quantile=0.95, struct_drop=0.2, warm_up=100),
     "nba":        dict(lambda_fair=0.40, sbrs_quantile=0.5, struct_drop=0.3, warm_up=200),
 }
 
