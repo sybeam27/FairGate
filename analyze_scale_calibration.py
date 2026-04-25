@@ -25,7 +25,7 @@ train.py에 --log_training 플래그 사용.
 import os, sys, argparse, subprocess
 import pandas as pd
 
-DEVICE = "cuda:0"
+DEVICE = "cuda:1"
 
 DEFAULT_DATASETS = ["pokec_z", "german", "nba", "credit", "recidivism"]
 
