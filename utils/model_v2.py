@@ -113,19 +113,6 @@ def _minmax(x):
     return (x - x.min()) / (x.max() - x.min() + 1e-8)
 
 
-def _top_quantile_gate(score, q: float, min_gate: int = 1):
-    """Select top-(1-q) nodes without tie-induced full gating."""
-    N = score.numel()
-    q = float(max(0.0, min(0.999999, q)))
-    k = max(min_gate, int(round((1.0 - q) * N)))
-    k = min(max(k, min_gate), N)
-    idx = torch.topk(score, k=k, largest=True, sorted=False).indices
-    gate = torch.zeros(N, dtype=torch.bool, device=score.device)
-    gate[idx] = True
-    thr = float(score[idx].min().item()) if idx.numel() > 0 else float(score.max().item())
-    return gate, thr
-
-
 def _compute_structural_signals(data):
     """
     Compute node-level structural signals.
@@ -237,12 +224,12 @@ def _compute_edge_homophily(data) -> float:
 @torch.no_grad()
 def _compute_loss_based_signal(model, data) -> torch.Tensor:
     """
-    Per-node fairness-relevant risk signal.
+    Per-node fairness-relevant risk signal: BCELoss(node) weighted by
+    cross-group neighbor fraction.
 
-    BCE is computed only for valid binary labels. Nodes with invalid labels
-    such as -1 are assigned zero supervised loss and still receive structural
-    risk through boundary/degree signals. This avoids corrupting FIW on
-    Pokec/NBA, where unlabeled nodes remain in the graph.
+    On heterophilic graphs, nodes whose individual prediction loss is large
+    AND whose inter-group exposure is high are the ones where gating matters.
+    This replaces pure boundary proximity as the primary discriminator.
     """
     was_training = model.training
     model.eval()
@@ -250,17 +237,14 @@ def _compute_loss_based_signal(model, data) -> torch.Tensor:
     out = model(data)
     if isinstance(out, tuple):
         out = out[0]
-    out = out.view(-1)
 
     labels = data.y.float()
-    valid = (labels == 0.0) | (labels == 1.0)
+    # per-node BCE
+    node_loss = F.binary_cross_entropy_with_logits(
+        out.view(-1), labels, reduction="none"
+    )
 
-    node_loss = torch.zeros_like(out)
-    if valid.sum() > 0:
-        node_loss[valid] = F.binary_cross_entropy_with_logits(
-            out[valid], labels[valid], reduction="none"
-        )
-
+    # inter-group neighbor fraction (same as w_boundary numerator)
     edge_index = data.edge_index
     src, dst   = edge_index
     N          = data.x.size(0)
@@ -273,12 +257,10 @@ def _compute_loss_based_signal(model, data) -> torch.Tensor:
     cross_cnt.scatter_add_(0, src, cross)
     inter_frac = cross_cnt / (deg + 1e-8)
 
-    signal = node_loss * (0.5 + inter_frac)
-    signal = _minmax(signal) if valid.sum() > 0 else _minmax(inter_frac)
-
+    signal = node_loss * inter_frac
     if was_training:
         model.train()
-    return signal.detach()
+    return _minmax(signal).detach()
 
 
 def _estimate_uncertainty(model, data, uncertainty_type="entropy"):
@@ -293,100 +275,6 @@ def _estimate_uncertainty(model, data, uncertainty_type="entropy"):
 # ── Homophily threshold below which the adaptive gating is activated ──────────
 _LOW_HOMOPHILY_THR = 0.5
 
-# ── Minimum samples per (sens, label) cell for reliable CF-FV ─────────────────
-_CF_FV_MIN_CELL = 5
-
-
-@torch.no_grad()
-def _compute_cf_fairness_violation(model, data) -> torch.Tensor:
-    """
-    Per-node counterfactual fairness violation (CF-FV).
-
-    For each node v, CF-FV measures how much its predicted probability
-    differs from the mean prediction of the *opposite* sensitive group
-    conditioned on the *same* label:
-
-        CF-FV(v) = |p(v) - mean_{u: s_u ≠ s_v, y_u = y_v} p(u)|
-
-    This is the same fairness violation metric used in the empirical
-    analysis (Sec. 4), ensuring consistency between the analysis that
-    motivates the uncertainty direction and the FIW computation that
-    implements it.
-
-    Computation is O(N) via group-level aggregation over the four
-    (sens, label) cells: (0,0), (0,1), (1,0), (1,1).
-    Nodes whose opposite-group cell has fewer than _CF_FV_MIN_CELL
-    valid samples fall back to zero CF-FV.
-
-    Returns
-    -------
-    cf_fv : torch.Tensor, shape [N], values in [0, 1]
-        Min-max normalized per-node counterfactual FV.
-    r_uf  : float
-        Pearson r(uncertainty, CF-FV) over valid nodes.
-        Positive  → Pattern B (high-homophily, high-u = high risk)
-        Negative  → Pattern A (low-homophily,  low-u  = high risk)
-    """
-    was_training = model.training
-    model.eval()
-
-    out = model(data)
-    if isinstance(out, tuple):
-        out = out[0]
-    p = torch.sigmoid(out.view(-1)).clamp(1e-6, 1.0 - 1e-6)
-
-    labels = data.y.float()
-    sens   = data.sens.float()
-    valid  = (labels == 0.0) | (labels == 1.0)
-
-    N      = data.x.size(0)
-    device = data.x.device
-    cf_fv  = torch.zeros(N, device=device)
-
-    # Compute group means for each (sens, label) combination
-    group_mean = {}   # (s, y) → mean predicted probability
-    group_cnt  = {}
-    for s_val in [0, 1]:
-        for y_val in [0, 1]:
-            mask = valid & (sens == s_val) & (labels == y_val)
-            cnt  = int(mask.sum().item())
-            group_mean[(s_val, y_val)] = (
-                float(p[mask].mean().item()) if cnt > 0 else float('nan')
-            )
-            group_cnt[(s_val, y_val)]  = cnt
-
-    # Assign per-node CF-FV
-    for s_val in [0, 1]:
-        opp_s = 1 - s_val
-        for y_val in [0, 1]:
-            mask    = valid & (sens == s_val) & (labels == y_val)
-            opp_cnt = group_cnt[(opp_s, y_val)]
-            if mask.sum() == 0 or opp_cnt < _CF_FV_MIN_CELL:
-                continue
-            opp_mean      = group_mean[(opp_s, y_val)]
-            cf_fv[mask]   = (p[mask] - opp_mean).abs()
-
-    # Pearson r(uncertainty, CF-FV) over valid nodes
-    u_n   = _estimate_entropy_uncertainty(model, data)
-    valid_cf = valid & (cf_fv > 1e-6)
-    if int(valid_cf.sum().item()) >= 10:
-        fv_v  = cf_fv[valid_cf].cpu().float()
-        u_v   = u_n[valid_cf].cpu().float()
-        fv_z  = fv_v - fv_v.mean()
-        u_z   = u_v  - u_v.mean()
-        denom = (fv_z.norm() * u_z.norm()).clamp(min=1e-8)
-        r_uf  = float((fv_z * u_z).sum() / denom)
-    else:
-        r_uf  = 0.0          # fallback: not enough signal
-
-    # Normalize CF-FV to [0, 1]
-    cf_fv = _minmax(cf_fv)
-
-    if was_training:
-        model.train()
-
-    return cf_fv.detach(), r_uf
-
 
 def compute_fiw_weights(
     data,
@@ -394,7 +282,7 @@ def compute_fiw_weights(
     sbrs_quantile=0.7,
     fips_lam=1.0,
     uncertainty_type="entropy",
-    gating_mode_override: str = "adaptive",
+    gating_mode_override: str = "score",
     fiw_weight_mode: str = "continuous_uncert",
 ):
     """
@@ -411,14 +299,8 @@ def compute_fiw_weights(
            alpha = Var(w_boundary) / (Var(w_boundary) + Var(w_degree))
            beta  = Var(w_degree)   / (Var(w_boundary) + Var(w_degree))
            s_struct(v) = alpha * w_boundary(v) + beta * w_degree(v)
-        3) Topology-aware uncertainty modulation via CF-FV direction:
-           Measure r(u, CF-FV) at runtime using counterfactual FV
-           (same metric as the empirical analysis in Sec. 4):
-             r >= 0  → Pattern B: high-u nodes are high-risk
-                        U_eff(v) = u(v)
-             r <  0  → Pattern A: low-u nodes are high-risk
-                        U_eff(v) = 1 - u(v)
-           FIW(v) ∝ s_struct(v) * (1 + fips_lam * U_eff(v))
+        3) Modulate gated nodes with uncertainty:
+           FIW(v) ∝ s_struct(v) * (1 + fips_lam * U(v))
 
     Graph regime detection:
         boundary_ratio ≥ 0.9 (saturated): w_boundary 변별력 붕괴
@@ -430,10 +312,8 @@ def compute_fiw_weights(
     N      = data.x.size(0)
     device = data.x.device
 
-    assert gating_mode_override in (
-        "none", "score", "adaptive", "boundary", "degree",
-        "boundary_degree", "loss", "random"
-    ), f"Unsupported gating_mode_override: {gating_mode_override}"
+    assert gating_mode_override in ("none", "score", "random"), \
+        f"Unsupported gating_mode_override: {gating_mode_override}"
     assert fiw_weight_mode in (
         "uniform", "struct_only", "continuous_uncert",
         "binary_mean", "matched_random_perm"
@@ -444,69 +324,50 @@ def compute_fiw_weights(
     w_boundary = sig["w_boundary"]
     w_lhd      = sig["w_lhd"]  # diagnostics only
 
-    # ── Graph-adaptive FIW gating ─────────────────────────────────────
-    # The previous fixed rule used boundary-first gating for all graphs.
-    # The updated rule makes the *selection signal* adaptive while keeping
-    # continuous risk-aware weighting.
+    # ── 2순위 개선: Graph-regime-adaptive gating ──────────────────────────
+    # 그래프 구조 특성에 따라 gating 신호를 적응적으로 결정한다.
     #
-    # Override modes for ablation:
-    #   boundary        : gate by boundary exposure only
-    #   degree          : gate by degree risk only
-    #   boundary_degree : gate by variance-mixed boundary/degree score
-    #   loss            : gate by loss-based signal when available
-    #   random          : random gate with the same budget
-    #   none            : uniform weights
-    #   score/adaptive  : graph-regime-adaptive default
+    # [heterophilic]  homophily < 0.5:
+    #     w_boundary가 실제 불공정 위험을 잘못 표현할 수 있음.
+    #     per-node loss × inter-group 노출 신호를 혼합하여 보완.
+    #
+    # [saturated]  boundary_ratio ≥ 0.9:
+    #     거의 모든 노드가 경계에 있어 w_boundary의 변별력이 붕괴됨.
+    #     → Phase 2: loss_signal 기반으로 전환 (실제 예측 오류가 큰 노드 우선)
+    #     → warm-up: w_degree 기반 fallback (degree 불균형이 구조적 대리 신호)
+    #
+    # [그 외]:  w_boundary 그대로 사용.
     homophily      = _compute_edge_homophily(data)
-    graph_stats    = _compute_graph_stats(data)
-    boundary_ratio = graph_stats["boundary_ratio"]
-    deg_gap        = graph_stats["deg_gap"]
+    boundary_ratio = _compute_graph_stats(data)["boundary_ratio"]
 
-    has_model = model is not None
-    loss_signal = _compute_loss_based_signal(model, data) if has_model else None
+    is_heterophilic = homophily < _LOW_HOMOPHILY_THR
+    is_saturated    = boundary_ratio >= _BOUNDARY_SAT_THR
 
-    vars_tmp = torch.stack([w_boundary.var(), w_degree.var()])
-    coefs_tmp = vars_tmp / (vars_tmp.sum() + 1e-8)
-    bd_score = _minmax(coefs_tmp[0] * w_boundary + coefs_tmp[1] * w_degree)
-
-    requested_gate = "adaptive" if gating_mode_override == "score" else gating_mode_override
-
-    if requested_gate == "boundary":
-        gating_signal = w_boundary
-        gating_mode = "boundary"
-    elif requested_gate == "degree":
-        gating_signal = w_degree
-        gating_mode = "degree"
-    elif requested_gate == "boundary_degree":
-        gating_signal = bd_score
-        gating_mode = "boundary_degree"
-    elif requested_gate == "loss":
-        gating_signal = loss_signal if loss_signal is not None else w_degree
-        gating_mode = "loss" if loss_signal is not None else "loss_fallback_degree"
-    elif requested_gate == "random":
-        gating_signal = bd_score
-        gating_mode = "random"
-    else:
-        # Adaptive default.
-        if boundary_ratio >= _BOUNDARY_SAT_THR:
-            gating_signal = loss_signal if loss_signal is not None else w_degree
-            gating_mode = "adaptive_saturated_loss" if loss_signal is not None else "adaptive_saturated_degree"
-        elif deg_gap > _DEG_GAP_THR:
-            gating_signal = w_degree
-            gating_mode = "adaptive_degree"
-        elif homophily < _LOW_HOMOPHILY_THR and loss_signal is not None:
-            mix = 1.0 - homophily / _LOW_HOMOPHILY_THR
-            gating_signal = _minmax((1.0 - mix) * w_boundary + mix * loss_signal)
-            gating_mode = "adaptive_heterophilic"
-        elif boundary_ratio < _BOUNDARY_RATIO_THR:
-            gating_signal = w_boundary
-            gating_mode = "adaptive_boundary"
+    if is_saturated:
+        # w_boundary 변별력 붕괴 → 대체 신호 사용
+        if model is not None:
+            # Phase 2: per-node 예측 손실 기반 gating
+            loss_signal   = _compute_loss_based_signal(model, data)
+            gating_signal = _minmax(loss_signal)
+            gating_mode   = "saturated_loss"
         else:
-            gating_signal = bd_score
-            gating_mode = "adaptive_boundary_degree"
+            # warm-up: degree 기반 fallback
+            gating_signal = w_degree
+            gating_mode   = "saturated_degree"
+    elif is_heterophilic and model is not None:
+        loss_signal = _compute_loss_based_signal(model, data)
+        # 혼합 비율: homophily가 낮을수록 loss_signal 비중 증가
+        mix = 1.0 - homophily / _LOW_HOMOPHILY_THR   # ∈ (0, 1]
+        gating_signal = (1.0 - mix) * w_boundary + mix * loss_signal
+        gating_signal = _minmax(gating_signal)
+        gating_mode   = "heterophilic"
+    else:
+        gating_signal = w_boundary
+        gating_mode   = "boundary"
+    # ─────────────────────────────────────────────────────────────────────
 
-    # Exact top-quantile gate avoids full gating due to tied scores.
-    score_gate, boundary_threshold = _top_quantile_gate(gating_signal, sbrs_quantile)
+    boundary_threshold = float(torch.quantile(gating_signal, sbrs_quantile).item())
+    score_gate = gating_signal >= boundary_threshold
     gate = score_gate.clone()
 
     # FIW ablation: override the node-selection mechanism.
@@ -631,38 +492,14 @@ def compute_fiw_weights(
 
     u_n = _estimate_uncertainty(model, data, uncertainty_type=uncertainty_type)
 
-    # ── Topology-aware uncertainty direction via CF-FV ────────────────────────
-    # Compute counterfactual FV (same metric as Sec. 4 analysis) and measure
-    # Pearson r(u, CF-FV) to determine which direction uncertainty should
-    # modulate fairness intervention.
-    #
-    # Pattern A (r < 0): low-uncertainty boundary nodes carry highest FV.
-    #   → Use U_eff = 1 - u  so that low-u nodes receive HIGHER FIW.
-    # Pattern B (r ≥ 0): high-uncertainty × structural risk amplifies FV.
-    #   → Use U_eff = u  so that high-u nodes receive HIGHER FIW.
-    #
-    # CF-FV is O(N) via group-level aggregation; it adds negligible overhead.
-    # This branch is skipped for struct_only mode (no uncertainty used).
-    if fiw_weight_mode != "struct_only":
-        cf_fv_signal, r_uf = _compute_cf_fairness_violation(model, data)
-        unc_direction = "negative" if r_uf < 0 else "positive"
-        u_eff = (1.0 - u_n) if unc_direction == "negative" else u_n
-        print(
-            f"[FIW] unc_direction={unc_direction}  "
-            f"r(u,CF-FV)={r_uf:+.4f}  "
-            f"homophily={homophily:.4f}"
-        )
-    else:
-        r_uf, unc_direction, u_eff = 0.0, "none", u_n
-
     if fiw_weight_mode == "matched_random_perm":
-        # F7: preserve score-based Full-FIW weight distribution on random nodes.
+        # F7: preserve the score-based Full-FIW gated weight distribution,
+        # but assign it to random nodes. This isolates node assignment.
         n_gate = max(1, int(score_gate.sum().item()))
         score_gate_for_weights = score_gate
         if score_gate_for_weights.sum() == 0:
             score_gate_for_weights = gate
-        combined_score = struct_score[score_gate_for_weights] * (
-            1.0 + fips_lam * u_eff[score_gate_for_weights])
+        combined_score = struct_score[score_gate_for_weights] * (1.0 + fips_lam * u_n[score_gate_for_weights])
         combined_score = _minmax(combined_score)
         full_gate_weight = _WEIGHT_MIN + (_WEIGHT_MAX - _WEIGHT_MIN) * combined_score
 
@@ -681,17 +518,16 @@ def compute_fiw_weights(
             weight[gate] = _WEIGHT_MIN + (_WEIGHT_MAX - _WEIGHT_MIN) * gated_struct
 
         elif fiw_weight_mode == "binary_mean":
-            # F6: constant weight equal to mean Full-FIW gated weight.
-            combined = struct_score[gate] * (1.0 + fips_lam * u_eff[gate])
+            # F6: same FIW-selected nodes, but all gated nodes receive a constant
+            # weight equal to the mean Full-FIW gated weight.
+            combined = struct_score[gate] * (1.0 + fips_lam * u_n[gate])
             combined = _minmax(combined)
             full_gate_weight = _WEIGHT_MIN + (_WEIGHT_MAX - _WEIGHT_MIN) * combined
             weight[gate] = full_gate_weight.mean().detach()
 
         elif fiw_weight_mode == "continuous_uncert":
-            # Full FIW: continuous structural score with CF-FV-directed uncertainty.
-            # u_eff direction is determined by r(u, CF-FV) measured at runtime,
-            # ensuring consistency with the empirical analysis in Sec. 4.
-            combined = struct_score[gate] * (1.0 + fips_lam * u_eff[gate])
+            # Full FIW / F1 / F2 / F3: continuous structural score with uncertainty.
+            combined = struct_score[gate] * (1.0 + fips_lam * u_n[gate])
             combined = _minmax(combined)
             weight[gate] = _WEIGHT_MIN + (_WEIGHT_MAX - _WEIGHT_MIN) * combined
 
@@ -706,8 +542,6 @@ def compute_fiw_weights(
         gated=int(gate.sum().item()),
         n_total=N,
         uncertainty_type=uncertainty_type if fiw_weight_mode != "struct_only" else "none",
-        unc_direction=unc_direction,
-        r_uf=round(r_uf, 4),
         homophily=round(homophily, 4),
         gating_mode=gating_mode,
         fiw_weight_mode=fiw_weight_mode,
@@ -1036,14 +870,8 @@ class FairGate:
         recal_interval   = _RECAL_INTERVAL,
         alpha_beta_mode  : str = "variance",   # ablation용 (3번 한계)
         edge_intervention: str = "drop",       # bridge 보존 옵션 (4번 한계)
-        gating_mode_override: str = "adaptive",
+        gating_mode_override: str = "score",
         fiw_weight_mode: str = "continuous_uncert",
-        fiw_adaptive: bool = False,
-        adaptive_probe_epochs: int = 20,
-        adaptive_eta: float = 1.0,
-        adaptive_auc_tol: float = 0.005,
-        ablation_mode: str = "full_loss",
-        disable_scale_calibration: bool = False,
     ):
         assert backbone in ("GCN", "GraphSAGE", "SGC"), \
             f"Unsupported backbone: {backbone}"
@@ -1053,18 +881,12 @@ class FairGate:
         ), f"alpha_beta_mode must be variance/mutual_info/uniform/bnd_only/deg_only/random, got: {alpha_beta_mode}"
         assert edge_intervention in ("drop", "scale"), \
             f"edge_intervention must be 'drop' or 'scale', got: {edge_intervention}"
-        assert gating_mode_override in (
-            "none", "score", "adaptive", "boundary", "degree",
-            "boundary_degree", "loss", "random"
-        ), f"Unsupported gating_mode_override: {gating_mode_override}"
+        assert gating_mode_override in ("none", "score", "random"), \
+            f"gating_mode_override must be none/score/random, got: {gating_mode_override}"
         assert fiw_weight_mode in (
             "uniform", "struct_only", "continuous_uncert",
             "binary_mean", "matched_random_perm"
         ), f"Unsupported fiw_weight_mode: {fiw_weight_mode}"
-        assert ablation_mode in (
-            "none", "struct_only", "struct_rep", "struct_out",
-            "rep_out", "full_loss"
-        ), f"Unsupported ablation_mode: {ablation_mode}"
 
         self.device            = device
         self.backbone_name     = backbone
@@ -1082,13 +904,6 @@ class FairGate:
         self.edge_intervention = edge_intervention
         self.gating_mode_override = gating_mode_override
         self.fiw_weight_mode = fiw_weight_mode
-        self.fiw_adaptive = fiw_adaptive
-        self.adaptive_probe_epochs = int(adaptive_probe_epochs)
-        self.adaptive_eta = float(adaptive_eta)
-        self.adaptive_auc_tol = float(adaptive_auc_tol)
-        self.ablation_mode = ablation_mode
-        self.disable_scale_calibration = bool(disable_scale_calibration)
-        self._adaptive_choice = None
 
         self.name = f"{backbone}/FairGate"
 
@@ -1196,21 +1011,14 @@ class FairGate:
 
         struct_loss = rep_loss = out_loss = task_loss.new_tensor(0.0)
 
-        use_struct = self.ablation_mode in ("full_loss", "struct_only", "struct_rep", "struct_out")
-        use_rep    = self.ablation_mode in ("full_loss", "struct_rep", "rep_out")
-        use_out    = self.ablation_mode in ("full_loss", "struct_out", "rep_out")
-
-        if lam > 0.0 and self.ablation_mode != "none":
-            if use_struct:
-                struct_loss = compute_structural_loss(
-                    self.model, data, self._node_w, self.struct_drop,
-                    edge_intervention=self.edge_intervention)
-            if use_rep:
-                rep_loss = self._rep_loss(h, sens, self._node_w, idx_fair)
-            if use_out:
-                out_loss = compute_output_loss(
-                    torch.sigmoid(out), labels, sens,
-                    self._node_w, idx_fair, self.dp_eo_ratio)
+        if lam > 0.0:
+            struct_loss = compute_structural_loss(
+                self.model, data, self._node_w, self.struct_drop,
+                edge_intervention=self.edge_intervention)
+            rep_loss    = self._rep_loss(h, sens, self._node_w, idx_fair)
+            out_loss    = compute_output_loss(
+                torch.sigmoid(out), labels, sens,
+                self._node_w, idx_fair, self.dp_eo_ratio)
 
         total = task_loss + lam * (
             self._scales["struct"] * struct_loss
@@ -1228,122 +1036,6 @@ class FairGate:
             rep=float(rep_loss),
             out=float(out_loss),
         )
-
-    def _metric_auc(self, result):
-        for key in ("roc_auc", "auc", "AUC", "roc_auc_mean"):
-            if key in result and result[key] is not None:
-                return float(result[key])
-        return float(result.get("acc", 0.0))
-
-    def _metric_fair(self, result):
-        return abs(float(result.get("dp", 0.0))) + abs(float(result.get("eo", 0.0)))
-
-    def _adaptive_candidate_score(self, result, auc_ref):
-        auc = self._metric_auc(result)
-        fair = self._metric_fair(result)
-        auc_penalty = max(0.0, auc_ref - auc - self.adaptive_auc_tol)
-        return fair + self.adaptive_eta * auc_penalty
-
-    def _set_fiw_candidate(self, cand):
-        self.gating_mode_override = cand["gating"]
-        self.alpha_beta_mode = cand["alpha_beta"]
-        self.fiw_weight_mode = cand["weight"]
-
-    def _adaptive_candidates(self, data):
-        """Candidate FIW policies for validation-based adaptive selection."""
-        return [
-            {"name": "boundary", "gating": "boundary", "alpha_beta": "bnd_only", "weight": "continuous_uncert"},
-            {"name": "degree", "gating": "degree", "alpha_beta": "deg_only", "weight": "continuous_uncert"},
-            {"name": "no_uncert", "gating": "adaptive", "alpha_beta": "variance", "weight": "struct_only"},
-            {"name": "full", "gating": "adaptive", "alpha_beta": "variance", "weight": "continuous_uncert"},
-        ]
-
-    def _select_adaptive_fiw_mode(self, data, lr, weight_decay, criterion, verbose=True):
-        """
-        Select a FIW policy on the validation split.
-
-        Each candidate starts from the same warm-up checkpoint, is trained for a
-        small number of probe epochs, and is scored by validation fairness with
-        an AUC-preserving penalty. The warm-up checkpoint is restored before
-        main Phase-2 training.
-        """
-        if self.adaptive_probe_epochs <= 0 or self.lambda_fair <= 0.0:
-            return
-
-        warm_state = copy.deepcopy(self.model.state_dict())
-        base_result = evaluate_pyg_model(self.model, data, split="val", task_type="classification")
-        auc_ref = self._metric_auc(base_result)
-
-        old_gate = self.gating_mode_override
-        old_ab = self.alpha_beta_mode
-        old_wmode = self.fiw_weight_mode
-        old_scales = copy.deepcopy(self._scales)
-        old_node_w = self._node_w.clone() if self._node_w is not None else None
-
-        best = None
-        logs = []
-
-        for cand in self._adaptive_candidates(data):
-            self.model.load_state_dict(warm_state)
-            self._set_fiw_candidate(cand)
-            data.alpha_beta_mode = self.alpha_beta_mode
-
-            self._node_w, meta = compute_fiw_weights(
-                data, model=self.model, sbrs_quantile=self.sbrs_quantile,
-                fips_lam=self.fips_lam, uncertainty_type=self.uncertainty_type,
-                gating_mode_override=self.gating_mode_override,
-                fiw_weight_mode=self.fiw_weight_mode,
-            )
-            if self.disable_scale_calibration:
-                self._scales = {"struct": 1.0, "rep": 1.0, "out": 1.0}
-            else:
-                self._calibrate_scales(data, criterion)
-
-            opt = self._optimizer(lr, weight_decay)
-            for _ in range(self.adaptive_probe_epochs):
-                self._train_step(data, opt, criterion, lam=self.lambda_fair)
-
-            val_result = evaluate_pyg_model(self.model, data, split="val", task_type="classification")
-            score = self._adaptive_candidate_score(val_result, auc_ref)
-            rec = dict(
-                cand=cand, score=score,
-                auc=self._metric_auc(val_result),
-                fair=self._metric_fair(val_result),
-                gated=meta.get("gated", 0),
-                gating_mode=meta.get("gating_mode", "?"),
-            )
-            logs.append(rec)
-            if best is None or score < best["score"]:
-                best = rec
-
-        self.model.load_state_dict(warm_state)
-        self._scales = old_scales
-        self._node_w = old_node_w
-
-        if best is not None:
-            self._set_fiw_candidate(best["cand"])
-            self._adaptive_choice = best
-        else:
-            self.gating_mode_override = old_gate
-            self.alpha_beta_mode = old_ab
-            self.fiw_weight_mode = old_wmode
-
-        data.alpha_beta_mode = self.alpha_beta_mode
-
-        if verbose:
-            print(f"[{self.name}] Adaptive FIW selection | auc_ref={auc_ref:.4f}")
-            for r in logs:
-                print(
-                    f"  - {r['cand']['name']:<10} score={r['score']:.4f} "
-                    f"auc={r['auc']:.4f} fair={r['fair']:.4f} "
-                    f"gate={r['gating_mode']} gated={r['gated']}"
-                )
-            if best is not None:
-                print(
-                    f"[{self.name}] Selected adaptive FIW: {best['cand']['name']} "
-                    f"(gating={self.gating_mode_override}, "
-                    f"alpha_beta={self.alpha_beta_mode}, weight={self.fiw_weight_mode})"
-                )
 
     def _val_score(self, result):
         acc = float(result.get("acc", 0.0))
@@ -1374,10 +1066,6 @@ class FairGate:
                 f"edge={self.edge_intervention}  "
                 f"gate_override={self.gating_mode_override}  "
                 f"weight_mode={self.fiw_weight_mode}  "
-                f"adaptive={self.fiw_adaptive}  "
-                f"probe_epochs={self.adaptive_probe_epochs}  "
-                f"ablation={self.ablation_mode}  "
-                f"disable_scale={self.disable_scale_calibration}  "
                 f"recal_interval={self.recal_interval}"
             )
         # ─────────────────────────────────────────────────────────────────────
@@ -1389,23 +1077,11 @@ class FairGate:
         for _ in range(self.warm_up):
             self._train_step(data, optimizer, criterion, lam=0.0)
 
-        # Optional validation-based Adaptive FIW policy selection.
-        if self.fiw_adaptive and self.lambda_fair > 0.0:
-            if verbose:
-                print(f"[{self.name}] Selecting adaptive FIW policy...")
-            self._select_adaptive_fiw_mode(data, lr, weight_decay, criterion, verbose=verbose)
-
         # Transition
         if verbose:
             print(f"[{self.name}] Updating FIW weights & calibrating scales...")
-        data.alpha_beta_mode = self.alpha_beta_mode
         self._update_weights_fiw(data)
-        if self.disable_scale_calibration:
-            self._scales = {"struct": 1.0, "rep": 1.0, "out": 1.0}
-            if verbose:
-                print(f"[{self.name}] Scale calibration disabled; using unit loss scales.")
-        else:
-            self._calibrate_scales(data, criterion)
+        self._calibrate_scales(data, criterion)
         self.model.train()
 
         # Phase 2
@@ -1426,13 +1102,7 @@ class FairGate:
             # warm-up 직후 단 한 번의 보정이 아니라, Phase 2 전반에 걸쳐
             # recal_interval 마다 손실 간 상대 비율을 재조정한다.
             # FIW 갱신과 인터리빙하여 오버헤드를 분산시킨다.
-            if (
-                (not self.disable_scale_calibration)
-                and self.recal_interval
-                and self.recal_interval > 0
-                and epoch > 0
-                and epoch % self.recal_interval == 0
-            ):
+            if epoch > 0 and epoch % self.recal_interval == 0:
                 if verbose:
                     print(f"[{self.name}] Periodic recalibration @ "
                           f"epoch {epoch + self.warm_up + 1}...")

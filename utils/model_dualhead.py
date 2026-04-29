@@ -1,27 +1,36 @@
 """
 FairGate — Fair Graph Neural Network with Hierarchical Fairness Intervention
 
-Revised design (aligned with the updated preliminary analysis):
+Design (v3 — dual-head learned uncertainty):
     Module 1: Hierarchical Fairness Intervention Weight (FIW)
-              - boundary-first gating
-              - degree as a secondary structural propagation axis
-              - predictive entropy as the default uncertainty signal
+              - topology-adaptive gating signal
+                  (boundary / degree / loss-blend by graph regime)
+              - variance-weighted structural priority score
+              - learned uncertainty σ(v) from dual-head UQ for within-gate
+                modulation (replaces entropy proxy)
     Module 2: 3-Level Fairness Loss
               L = L_task + λ_fair · (L_struct + L_rep + L_out)
+            + λ_uq · L_uq   (dual-head coverage + width penalty)
     Module 3: Scale-calibrated Training Loop
-              warm-up → FIW update → auto scale calibration → λ-ramp → early stopping
+              warm-up → FIW update → auto scale calibration → early stopping
 
-Key design changes from the previous version:
-    1) w_boundary and w_lhd are not treated as independent core FIW inputs.
-       On binary, high-homophily graphs they are often empirically redundant.
-       We therefore use w_boundary as the representative boundary-type signal
-       and keep w_lhd only for diagnostics.
+Key design decisions:
+    1) w_boundary and w_lhd are not independent FIW inputs.
+       w_boundary is the primary structural signal; w_lhd is diagnostics only.
     2) FIW is hierarchical:
-         (a) gate nodes by high boundary risk,
-         (b) rank gated nodes using a boundary-degree structural score,
-         (c) modulate intervention strength using uncertainty.
-    3) Predictive entropy is the default uncertainty source, because it matches
-       the pre-method analysis used to motivate the method.
+         (a) Gate nodes by topology-adaptive structural signal.
+         (b) Rank gated nodes via variance-weighted boundary-degree score.
+         (c) Modulate with learned σ(v) from the dual-head UQ head.
+    3) Learned uncertainty σ(v) replaces entropy as the within-gate
+       modulation signal.  Unlike entropy (a deterministic function of p),
+       σ(v) is trained via a coverage+width loss and captures node-level
+       aleatoric uncertainty independently of predicted probability.
+       Nodes with higher σ(v) receive stronger FIW, regardless of graph
+       topology—avoiding the direction-switching problem of entropy.
+    4) CF-FV direction switching is intentionally removed:
+       it was needed only when using entropy because entropy correlates
+       with fairness risk in opposite directions for Pattern A vs Pattern B.
+       Learned σ(v) does not have this ambiguity.
 """
 
 import copy
@@ -48,49 +57,77 @@ _RECAL_INTERVAL    = 200   # periodic scale recalibration every N Phase-2 epochs
 # ============================================================
 
 class GCN(nn.Module):
+    """GCN backbone with a decoupled prediction head and uncertainty-width head.
+
+    The default call remains backward-compatible: model(data) returns logits.
+    Use return_uq=True to additionally obtain a positive logit-width sigma(v).
+    """
     def __init__(self, in_feats, h_feats, dropout=0.5):
         super().__init__()
         self.conv1   = GCNConv(in_feats, h_feats)
-        self.conv2   = GCNConv(h_feats, 1)
+        self.conv2   = GCNConv(h_feats, 1)          # prediction head
+        self.uq_head = nn.Linear(h_feats, 1)        # uncertainty-width head
         self.dropout = dropout
 
-    def forward(self, data, edge_index=None, edge_weight=None, return_hidden=False):
+    def forward(self, data, edge_index=None, edge_weight=None,
+                return_hidden=False, return_uq=False):
         x          = data.x
         edge_index = data.edge_index if edge_index is None else edge_index
         h   = F.relu(self.conv1(x, edge_index, edge_weight=edge_weight))
         h   = F.dropout(h, p=self.dropout, training=self.training)
         out = self.conv2(h, edge_index, edge_weight=edge_weight).view(-1)
+        if return_uq:
+            sigma = F.softplus(self.uq_head(h).view(-1)) + 1e-6
+            if return_hidden:
+                return out, h, sigma
+            return out, sigma
         return (out, h) if return_hidden else out
 
 
 class GraphSAGE(nn.Module):
+    """GraphSAGE backbone with a decoupled uncertainty-width head."""
     def __init__(self, in_feats, h_feats, dropout=0.5):
         super().__init__()
         self.conv1   = SAGEConv(in_feats, h_feats)
         self.conv2   = SAGEConv(h_feats, 1)
+        self.uq_head = nn.Linear(h_feats, 1)
         self.dropout = dropout
 
-    def forward(self, data, edge_index=None, edge_weight=None, return_hidden=False):
+    def forward(self, data, edge_index=None, edge_weight=None,
+                return_hidden=False, return_uq=False):
         x          = data.x
         edge_index = data.edge_index if edge_index is None else edge_index
         # SAGEConv does not accept edge_weight → ignore silently
         h   = F.relu(self.conv1(x, edge_index))
         h   = F.dropout(h, p=self.dropout, training=self.training)
         out = self.conv2(h, edge_index).view(-1)
+        if return_uq:
+            sigma = F.softplus(self.uq_head(h).view(-1)) + 1e-6
+            if return_hidden:
+                return out, h, sigma
+            return out, sigma
         return (out, h) if return_hidden else out
 
 
 class SGC(nn.Module):
+    """SGC backbone with a simple uncertainty-width head on propagated features."""
     def __init__(self, in_feats, sgc_k=2):
         super().__init__()
         self.conv = SGConv(in_feats, 1, K=sgc_k)
+        self.uq_head = nn.Linear(in_feats, 1)
 
-    def forward(self, data, edge_index=None, edge_weight=None, return_hidden=False):
+    def forward(self, data, edge_index=None, edge_weight=None,
+                return_hidden=False, return_uq=False):
         # SGConv does not support edge_weight; scale mode falls back to drop in
         # compute_structural_loss automatically via the TypeError catch.
         x          = data.x
         edge_index = data.edge_index if edge_index is None else edge_index
         out = self.conv(x, edge_index).view(-1)
+        if return_uq:
+            sigma = F.softplus(self.uq_head(x).view(-1)) + 1e-6
+            if return_hidden:
+                return out, x, sigma
+            return out, sigma
         return (out, x) if return_hidden else out
 
 
@@ -281,111 +318,98 @@ def _compute_loss_based_signal(model, data) -> torch.Tensor:
     return signal.detach()
 
 
+@torch.no_grad()
+def _estimate_dual_uncertainty(model, data):
+    """Uncertainty from the dual-head logit interval width.
+
+    The model predicts logit z and positive width sigma. We convert this into
+    a probability interval [sigmoid(z-sigma), sigmoid(z+sigma)] and use its
+    width as the node-level uncertainty score. Unlike entropy, this uncertainty
+    is learned by a separate head and is not a deterministic function of p.
+    """
+    was_training = model.training
+    model.eval()
+
+    out = model(data, return_uq=True)
+    if not isinstance(out, tuple) or len(out) != 2:
+        raise RuntimeError("Model must support return_uq=True for dual uncertainty.")
+    z, sigma = out
+    z = z.view(-1)
+    sigma = sigma.view(-1).clamp(min=1e-6, max=20.0)
+    p_lo = torch.sigmoid(z - sigma)
+    p_hi = torch.sigmoid(z + sigma)
+    width = (p_hi - p_lo).clamp(min=0.0)
+
+    if was_training:
+        model.train()
+    return _minmax(width).detach()
+
+
+def compute_dual_uq_loss(model, data, idx_train=None, width_penalty=0.05, node_weight=None):
+    """QpiGNN-inspired dual-head uncertainty objective for binary classification.
+
+    The uncertainty head predicts a logit interval [z-sigma, z+sigma].
+    We penalize labels that fall outside the corresponding probability interval
+    while also discouraging trivially wide intervals. This gives the uncertainty
+    head its own learning signal, instead of reusing entropy as uncertainty.
+
+    L_uq = coverage_violation + width_penalty * interval_width
+
+    Important: this loss should be computed on the training labels only.
+    """
+    if idx_train is None:
+        idx_train = data.train_mask.nonzero(as_tuple=False).view(-1)
+
+    z, sigma = model(data, return_uq=True)
+    z = z.view(-1)
+    sigma = sigma.view(-1).clamp(min=1e-6, max=20.0)
+
+    labels = data.y.float()
+    valid = ((labels == 0.0) | (labels == 1.0))
+    mask = torch.zeros_like(valid, dtype=torch.bool)
+    mask[idx_train] = True
+    idx = (valid & mask).nonzero(as_tuple=False).view(-1)
+    if idx.numel() == 0:
+        zero = z.sum() * 0.0
+        return zero, {"uq_cov": 0.0, "uq_width": 0.0}
+
+    y = labels[idx]
+    p_lo = torch.sigmoid(z[idx] - sigma[idx])
+    p_hi = torch.sigmoid(z[idx] + sigma[idx])
+    interval_width = (p_hi - p_lo).clamp(min=0.0)
+
+    # zero if y lies inside [p_lo, p_hi], positive otherwise
+    coverage_violation = F.relu(p_lo - y) + F.relu(y - p_hi)
+
+    if node_weight is not None:
+        w = node_weight[idx].detach()
+        w = w / (w.mean() + 1e-8)
+        cov_loss = (coverage_violation * w).mean()
+        width_loss = (interval_width * w).mean()
+    else:
+        cov_loss = coverage_violation.mean()
+        width_loss = interval_width.mean()
+
+    loss = cov_loss + float(width_penalty) * width_loss
+    return loss, {
+        "uq_cov": float(cov_loss.detach()),
+        "uq_width": float(width_loss.detach()),
+    }
+
+
 def _estimate_uncertainty(model, data, uncertainty_type="entropy"):
     if uncertainty_type == "entropy":
         return _estimate_entropy_uncertainty(model, data)
     elif uncertainty_type == "mc":
         return _estimate_mc_uncertainty(model, data)
+    elif uncertainty_type == "dual":
+        return _estimate_dual_uncertainty(model, data)
     else:
         raise ValueError(f"Unsupported uncertainty_type: {uncertainty_type}")
 
 
 # ── Homophily threshold below which the adaptive gating is activated ──────────
 _LOW_HOMOPHILY_THR = 0.5
-
-# ── Minimum samples per (sens, label) cell for reliable CF-FV ─────────────────
-_CF_FV_MIN_CELL = 5
-
-
-@torch.no_grad()
-def _compute_cf_fairness_violation(model, data) -> torch.Tensor:
-    """
-    Per-node counterfactual fairness violation (CF-FV).
-
-    For each node v, CF-FV measures how much its predicted probability
-    differs from the mean prediction of the *opposite* sensitive group
-    conditioned on the *same* label:
-
-        CF-FV(v) = |p(v) - mean_{u: s_u ≠ s_v, y_u = y_v} p(u)|
-
-    This is the same fairness violation metric used in the empirical
-    analysis (Sec. 4), ensuring consistency between the analysis that
-    motivates the uncertainty direction and the FIW computation that
-    implements it.
-
-    Computation is O(N) via group-level aggregation over the four
-    (sens, label) cells: (0,0), (0,1), (1,0), (1,1).
-    Nodes whose opposite-group cell has fewer than _CF_FV_MIN_CELL
-    valid samples fall back to zero CF-FV.
-
-    Returns
-    -------
-    cf_fv : torch.Tensor, shape [N], values in [0, 1]
-        Min-max normalized per-node counterfactual FV.
-    r_uf  : float
-        Pearson r(uncertainty, CF-FV) over valid nodes.
-        Positive  → Pattern B (high-homophily, high-u = high risk)
-        Negative  → Pattern A (low-homophily,  low-u  = high risk)
-    """
-    was_training = model.training
-    model.eval()
-
-    out = model(data)
-    if isinstance(out, tuple):
-        out = out[0]
-    p = torch.sigmoid(out.view(-1)).clamp(1e-6, 1.0 - 1e-6)
-
-    labels = data.y.float()
-    sens   = data.sens.float()
-    valid  = (labels == 0.0) | (labels == 1.0)
-
-    N      = data.x.size(0)
-    device = data.x.device
-    cf_fv  = torch.zeros(N, device=device)
-
-    # Compute group means for each (sens, label) combination
-    group_mean = {}   # (s, y) → mean predicted probability
-    group_cnt  = {}
-    for s_val in [0, 1]:
-        for y_val in [0, 1]:
-            mask = valid & (sens == s_val) & (labels == y_val)
-            cnt  = int(mask.sum().item())
-            group_mean[(s_val, y_val)] = (
-                float(p[mask].mean().item()) if cnt > 0 else float('nan')
-            )
-            group_cnt[(s_val, y_val)]  = cnt
-
-    # Assign per-node CF-FV
-    for s_val in [0, 1]:
-        opp_s = 1 - s_val
-        for y_val in [0, 1]:
-            mask    = valid & (sens == s_val) & (labels == y_val)
-            opp_cnt = group_cnt[(opp_s, y_val)]
-            if mask.sum() == 0 or opp_cnt < _CF_FV_MIN_CELL:
-                continue
-            opp_mean      = group_mean[(opp_s, y_val)]
-            cf_fv[mask]   = (p[mask] - opp_mean).abs()
-
-    # Pearson r(uncertainty, CF-FV) over valid nodes
-    u_n   = _estimate_entropy_uncertainty(model, data)
-    valid_cf = valid & (cf_fv > 1e-6)
-    if int(valid_cf.sum().item()) >= 10:
-        fv_v  = cf_fv[valid_cf].cpu().float()
-        u_v   = u_n[valid_cf].cpu().float()
-        fv_z  = fv_v - fv_v.mean()
-        u_z   = u_v  - u_v.mean()
-        denom = (fv_z.norm() * u_z.norm()).clamp(min=1e-8)
-        r_uf  = float((fv_z * u_z).sum() / denom)
-    else:
-        r_uf  = 0.0          # fallback: not enough signal
-
-    # Normalize CF-FV to [0, 1]
-    cf_fv = _minmax(cf_fv)
-
-    if was_training:
-        model.train()
-
-    return cf_fv.detach(), r_uf
 
 
 def compute_fiw_weights(
@@ -411,14 +435,14 @@ def compute_fiw_weights(
            alpha = Var(w_boundary) / (Var(w_boundary) + Var(w_degree))
            beta  = Var(w_degree)   / (Var(w_boundary) + Var(w_degree))
            s_struct(v) = alpha * w_boundary(v) + beta * w_degree(v)
-        3) Topology-aware uncertainty modulation via CF-FV direction:
-           Measure r(u, CF-FV) at runtime using counterfactual FV
-           (same metric as the empirical analysis in Sec. 4):
-             r >= 0  → Pattern B: high-u nodes are high-risk
-                        U_eff(v) = u(v)
-             r <  0  → Pattern A: low-u nodes are high-risk
-                        U_eff(v) = 1 - u(v)
-           FIW(v) ∝ s_struct(v) * (1 + fips_lam * U_eff(v))
+        3) Within-gate modulation with learned uncertainty σ(v):
+           FIW(v) ∝ s_struct(v) * (1 + fips_lam * σ(v))
+           where σ(v) = dual-head predicted interval width,
+           trained via coverage + width penalty loss (L_uq).
+           Unlike entropy, σ(v) is not a deterministic function of p(v);
+           it captures node-level aleatoric uncertainty independently,
+           so higher σ(v) reliably indicates higher intervention need
+           regardless of graph topology.
 
     Graph regime detection:
         boundary_ratio ≥ 0.9 (saturated): w_boundary 변별력 붕괴
@@ -631,29 +655,23 @@ def compute_fiw_weights(
 
     u_n = _estimate_uncertainty(model, data, uncertainty_type=uncertainty_type)
 
-    # ── Topology-aware uncertainty direction via CF-FV ────────────────────────
-    # Compute counterfactual FV (same metric as Sec. 4 analysis) and measure
-    # Pearson r(u, CF-FV) to determine which direction uncertainty should
-    # modulate fairness intervention.
+    # ── Within-gate modulation with learned uncertainty σ(v) ─────────────────
+    # When uncertainty_type="dual", u_n = σ(v) from the dual-head UQ head.
+    # Unlike entropy (which is a deterministic function of p(v) and may
+    # correlate with fairness risk in opposite directions depending on graph
+    # topology), σ(v) is trained via a coverage+width loss and captures
+    # aleatoric uncertainty independently.  Higher σ(v) → stronger FIW,
+    # regardless of Pattern A / Pattern B topology.
     #
-    # Pattern A (r < 0): low-uncertainty boundary nodes carry highest FV.
-    #   → Use U_eff = 1 - u  so that low-u nodes receive HIGHER FIW.
-    # Pattern B (r ≥ 0): high-uncertainty × structural risk amplifies FV.
-    #   → Use U_eff = u  so that high-u nodes receive HIGHER FIW.
-    #
-    # CF-FV is O(N) via group-level aggregation; it adds negligible overhead.
-    # This branch is skipped for struct_only mode (no uncertainty used).
-    if fiw_weight_mode != "struct_only":
-        cf_fv_signal, r_uf = _compute_cf_fairness_violation(model, data)
-        unc_direction = "negative" if r_uf < 0 else "positive"
-        u_eff = (1.0 - u_n) if unc_direction == "negative" else u_n
-        print(
-            f"[FIW] unc_direction={unc_direction}  "
-            f"r(u,CF-FV)={r_uf:+.4f}  "
-            f"homophily={homophily:.4f}"
-        )
-    else:
-        r_uf, unc_direction, u_eff = 0.0, "none", u_n
+    # When uncertainty_type="entropy" or "mc", u_n is a proxy uncertainty.
+    # The same formula applies; no direction switching is performed.
+    # CF-FV-based direction switching has been intentionally removed because
+    # it is unnecessary for learned uncertainty and adds complexity.
+    print(
+        f"[FIW] unc_type={uncertainty_type}  "
+        f"u_mean={float(u_n.mean()):.4f}  "
+        f"homophily={homophily:.4f}"
+    )
 
     if fiw_weight_mode == "matched_random_perm":
         # F7: preserve score-based Full-FIW weight distribution on random nodes.
@@ -662,7 +680,7 @@ def compute_fiw_weights(
         if score_gate_for_weights.sum() == 0:
             score_gate_for_weights = gate
         combined_score = struct_score[score_gate_for_weights] * (
-            1.0 + fips_lam * u_eff[score_gate_for_weights])
+            1.0 + fips_lam * u_n[score_gate_for_weights])
         combined_score = _minmax(combined_score)
         full_gate_weight = _WEIGHT_MIN + (_WEIGHT_MAX - _WEIGHT_MIN) * combined_score
 
@@ -682,16 +700,16 @@ def compute_fiw_weights(
 
         elif fiw_weight_mode == "binary_mean":
             # F6: constant weight equal to mean Full-FIW gated weight.
-            combined = struct_score[gate] * (1.0 + fips_lam * u_eff[gate])
+            combined = struct_score[gate] * (1.0 + fips_lam * u_n[gate])
             combined = _minmax(combined)
             full_gate_weight = _WEIGHT_MIN + (_WEIGHT_MAX - _WEIGHT_MIN) * combined
             weight[gate] = full_gate_weight.mean().detach()
 
         elif fiw_weight_mode == "continuous_uncert":
-            # Full FIW: continuous structural score with CF-FV-directed uncertainty.
-            # u_eff direction is determined by r(u, CF-FV) measured at runtime,
-            # ensuring consistency with the empirical analysis in Sec. 4.
-            combined = struct_score[gate] * (1.0 + fips_lam * u_eff[gate])
+            # Full FIW: continuous structural score modulated by learned σ(v).
+            # u_n = σ(v) when uncertainty_type="dual" (dual-head UQ head).
+            # Higher σ(v) → stronger intervention weight, regardless of topology.
+            combined = struct_score[gate] * (1.0 + fips_lam * u_n[gate])
             combined = _minmax(combined)
             weight[gate] = _WEIGHT_MIN + (_WEIGHT_MAX - _WEIGHT_MIN) * combined
 
@@ -706,8 +724,7 @@ def compute_fiw_weights(
         gated=int(gate.sum().item()),
         n_total=N,
         uncertainty_type=uncertainty_type if fiw_weight_mode != "struct_only" else "none",
-        unc_direction=unc_direction,
-        r_uf=round(r_uf, 4),
+        u_mean=round(float(u_n.mean().item()), 4),
         homophily=round(homophily, 4),
         gating_mode=gating_mode,
         fiw_weight_mode=fiw_weight_mode,
@@ -1044,6 +1061,12 @@ class FairGate:
         adaptive_auc_tol: float = 0.005,
         ablation_mode: str = "full_loss",
         disable_scale_calibration: bool = False,
+        # Dual-head uncertainty learning. Keep lambda_uq=0.0 to reproduce
+        # the original model. Set uncertainty_type="dual" and lambda_uq>0
+        # to learn an interval-width uncertainty head.
+        lambda_uq: float = 0.0,
+        uq_width_penalty: float = 0.05,
+        use_uq_weighted_loss: bool = False,
     ):
         assert backbone in ("GCN", "GraphSAGE", "SGC"), \
             f"Unsupported backbone: {backbone}"
@@ -1088,6 +1111,9 @@ class FairGate:
         self.adaptive_auc_tol = float(adaptive_auc_tol)
         self.ablation_mode = ablation_mode
         self.disable_scale_calibration = bool(disable_scale_calibration)
+        self.lambda_uq = float(lambda_uq)
+        self.uq_width_penalty = float(uq_width_penalty)
+        self.use_uq_weighted_loss = bool(use_uq_weighted_loss)
         self._adaptive_choice = None
 
         self.name = f"{backbone}/FairGate"
@@ -1194,6 +1220,21 @@ class FairGate:
         out, h    = self.model(data, return_hidden=True)
         task_loss = criterion(out[idx_train], labels[idx_train])
 
+        # Dual-head UQ is an auxiliary objective, not a direct FIW direction
+        # estimator. This keeps uncertainty logically consistent with the
+        # analysis: uncertainty is complementary and topology-dependent, so it
+        # should be learned/calibrated rather than treated as a universal
+        # monotonic fairness-risk multiplier.
+        uq_loss = task_loss.new_tensor(0.0)
+        uq_info = {"uq_cov": 0.0, "uq_width": 0.0}
+        if self.lambda_uq > 0.0:
+            uq_node_weight = self._node_w if self.use_uq_weighted_loss else None
+            uq_loss, uq_info = compute_dual_uq_loss(
+                self.model, data, idx_train=idx_train,
+                width_penalty=self.uq_width_penalty,
+                node_weight=uq_node_weight,
+            )
+
         struct_loss = rep_loss = out_loss = task_loss.new_tensor(0.0)
 
         use_struct = self.ablation_mode in ("full_loss", "struct_only", "struct_rep", "struct_out")
@@ -1212,7 +1253,7 @@ class FairGate:
                     torch.sigmoid(out), labels, sens,
                     self._node_w, idx_fair, self.dp_eo_ratio)
 
-        total = task_loss + lam * (
+        total = task_loss + self.lambda_uq * uq_loss + lam * (
             self._scales["struct"] * struct_loss
             + self._scales["rep"]  * rep_loss
             + self._scales["out"]  * out_loss
@@ -1227,6 +1268,9 @@ class FairGate:
             struct=float(struct_loss),
             rep=float(rep_loss),
             out=float(out_loss),
+            uq=float(uq_loss),
+            uq_cov=uq_info["uq_cov"],
+            uq_width=uq_info["uq_width"],
         )
 
     def _metric_auc(self, result):
@@ -1466,7 +1510,9 @@ class FairGate:
                     f"Task {info['task']:.4f} "
                     f"Struct {info['struct']:.4f} "
                     f"Rep {info['rep']:.4f} "
-                    f"Out {info['out']:.4f} | "
+                    f"Out {info['out']:.4f} "
+                    f"UQ {info.get('uq', 0.0):.4f} "
+                    f"(cov {info.get('uq_cov', 0.0):.4f}, width {info.get('uq_width', 0.0):.4f}) | "
                     f"Train {tr} | Val {val_result} | Score {score:.4f}"
                 )
 
@@ -1479,6 +1525,12 @@ class FairGate:
         self.model.load_state_dict(best_state)
         if verbose:
             print(f"[{self.name}] Done. Best val score: {best_score:.4f}")
+
+    @torch.no_grad()
+    def predict_uncertainty(self, data):
+        """Return learned dual-head probability-interval width in [0, 1]."""
+        self.model.eval()
+        return _estimate_dual_uncertainty(self.model, data)
 
     @torch.no_grad()
     def evaluate(self, data, split="test"):

@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from utils.model import FairGate
+from utils.model_dualhead import FairGate, _auto_config_from_graph_stats
 from utils.data  import get_dataset
 
 
@@ -64,6 +64,7 @@ def save_summary(summary: pd.DataFrame, args: argparse.Namespace):
         "adaptive_eta", "adaptive_auc_tol",
         "ablation_mode", "ablation_stage",
         "scale_condition",
+        "lambda_uq", "uq_width_penalty", "use_uq_weighted_loss",
         "sensitivity_param", "sensitivity_value",
     ]
 
@@ -192,6 +193,8 @@ def run_experiment(data, args):
           f"alpha_beta={args.alpha_beta_mode} edge={args.edge_intervention} "
           f"gate={args.gating_mode_override} wmode={args.fiw_weight_mode} "
           f"adaptive={args.fiw_adaptive} probe={args.adaptive_probe_epochs} "
+          f"unc={args.uncertainty_type} lambda_uq={args.lambda_uq} "
+          f"uq_width={args.uq_width_penalty} uq_weighted={args.use_uq_weighted_loss} "
           f"ablation={args.ablation_mode} scale_cond={args.scale_condition}")
     print(f"{'='*70}")
 
@@ -222,6 +225,9 @@ def run_experiment(data, args):
         adaptive_auc_tol = args.adaptive_auc_tol,
         ablation_mode = args.ablation_mode,
         disable_scale_calibration = (args.scale_condition == "no_calibration"),
+        lambda_uq = args.lambda_uq,
+        uq_width_penalty = args.uq_width_penalty,
+        use_uq_weighted_loss = args.use_uq_weighted_loss,
     )
 
     model.fit(
@@ -247,6 +253,9 @@ def run_experiment(data, args):
         "adaptive_auc_tol": args.adaptive_auc_tol,
         "ablation_mode": args.ablation_mode,
         "scale_condition": args.scale_condition,
+        "lambda_uq": args.lambda_uq,
+        "uq_width_penalty": args.uq_width_penalty,
+        "use_uq_weighted_loss": args.use_uq_weighted_loss,
         "selected_gating_mode": model.gating_mode_override,
         "selected_alpha_beta_mode": model.alpha_beta_mode,
         "selected_fiw_weight_mode": model.fiw_weight_mode,
@@ -293,7 +302,13 @@ def parse_args():
     g.add_argument("--fips_lam",      type=float, default=1.0)
     g.add_argument("--mmd_alpha",     type=float, default=0.3)
     g.add_argument("--dp_eo_ratio", type=float, default=0.3)
-    g.add_argument('--uncertainty_type', type=str, default='entropy', choices=['entropy', 'mc'])
+    g.add_argument('--uncertainty_type', type=str, default='entropy', choices=['entropy', 'mc', 'dual'])
+    g.add_argument('--lambda_uq', type=float, default=0.0,
+                   help='Dual-head uncertainty auxiliary loss coefficient. 0 disables UQ loss.')
+    g.add_argument('--uq_width_penalty', type=float, default=0.05,
+                   help='Penalty on prediction interval width for dual-head UQ.')
+    g.add_argument('--use_uq_weighted_loss', action='store_true',
+                   help='Weight dual-head UQ loss by FIW node weights. Use only after unweighted UQ is stable.')
     g.add_argument("--ramp_epochs", type=int,   default=0)
     g.add_argument("--recal_interval", type=int, default=200, help="Phase-2 epochs between periodic scale recalibrations")
     g.add_argument("--alpha_beta_mode", type=str, default="variance", choices=["variance", "mutual_info", "uniform", "bnd_only", "deg_only", "random"], help="α,β 계산 방식. ablation용 (기본: variance)")
@@ -344,7 +359,8 @@ if __name__ == "__main__":
           f"λ_u={args.fips_lam}  α={args.mmd_alpha}  "
           f"p={args.struct_drop}  T_w={args.warm_up}  "
           f"gate={args.gating_mode_override}  wmode={args.fiw_weight_mode}  "
-          f"adaptive={args.fiw_adaptive}")
+          f"adaptive={args.fiw_adaptive}  unc={args.uncertainty_type}  "
+          f"lambda_uq={args.lambda_uq}")
     print(f"Runs: {args.runs}  Seed base: {args.seed}")
     print(f"{'='*70}\n")
 
@@ -361,7 +377,6 @@ if __name__ == "__main__":
     has_inter      = torch.zeros(N, dtype=torch.bool)
     has_inter[src[is_inter]] = True
     boundary_ratio = has_inter.float().mean().item()
-    from utils.model import _auto_config_from_graph_stats
     regime = _auto_config_from_graph_stats(boundary_ratio, deg_gap)["regime"]
     print(f"[Graph Stats] homophily={homophily:.4f}  "
           f"boundary_ratio={boundary_ratio:.4f}  "

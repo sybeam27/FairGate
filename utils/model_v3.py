@@ -293,100 +293,6 @@ def _estimate_uncertainty(model, data, uncertainty_type="entropy"):
 # ── Homophily threshold below which the adaptive gating is activated ──────────
 _LOW_HOMOPHILY_THR = 0.5
 
-# ── Minimum samples per (sens, label) cell for reliable CF-FV ─────────────────
-_CF_FV_MIN_CELL = 5
-
-
-@torch.no_grad()
-def _compute_cf_fairness_violation(model, data) -> torch.Tensor:
-    """
-    Per-node counterfactual fairness violation (CF-FV).
-
-    For each node v, CF-FV measures how much its predicted probability
-    differs from the mean prediction of the *opposite* sensitive group
-    conditioned on the *same* label:
-
-        CF-FV(v) = |p(v) - mean_{u: s_u ≠ s_v, y_u = y_v} p(u)|
-
-    This is the same fairness violation metric used in the empirical
-    analysis (Sec. 4), ensuring consistency between the analysis that
-    motivates the uncertainty direction and the FIW computation that
-    implements it.
-
-    Computation is O(N) via group-level aggregation over the four
-    (sens, label) cells: (0,0), (0,1), (1,0), (1,1).
-    Nodes whose opposite-group cell has fewer than _CF_FV_MIN_CELL
-    valid samples fall back to zero CF-FV.
-
-    Returns
-    -------
-    cf_fv : torch.Tensor, shape [N], values in [0, 1]
-        Min-max normalized per-node counterfactual FV.
-    r_uf  : float
-        Pearson r(uncertainty, CF-FV) over valid nodes.
-        Positive  → Pattern B (high-homophily, high-u = high risk)
-        Negative  → Pattern A (low-homophily,  low-u  = high risk)
-    """
-    was_training = model.training
-    model.eval()
-
-    out = model(data)
-    if isinstance(out, tuple):
-        out = out[0]
-    p = torch.sigmoid(out.view(-1)).clamp(1e-6, 1.0 - 1e-6)
-
-    labels = data.y.float()
-    sens   = data.sens.float()
-    valid  = (labels == 0.0) | (labels == 1.0)
-
-    N      = data.x.size(0)
-    device = data.x.device
-    cf_fv  = torch.zeros(N, device=device)
-
-    # Compute group means for each (sens, label) combination
-    group_mean = {}   # (s, y) → mean predicted probability
-    group_cnt  = {}
-    for s_val in [0, 1]:
-        for y_val in [0, 1]:
-            mask = valid & (sens == s_val) & (labels == y_val)
-            cnt  = int(mask.sum().item())
-            group_mean[(s_val, y_val)] = (
-                float(p[mask].mean().item()) if cnt > 0 else float('nan')
-            )
-            group_cnt[(s_val, y_val)]  = cnt
-
-    # Assign per-node CF-FV
-    for s_val in [0, 1]:
-        opp_s = 1 - s_val
-        for y_val in [0, 1]:
-            mask    = valid & (sens == s_val) & (labels == y_val)
-            opp_cnt = group_cnt[(opp_s, y_val)]
-            if mask.sum() == 0 or opp_cnt < _CF_FV_MIN_CELL:
-                continue
-            opp_mean      = group_mean[(opp_s, y_val)]
-            cf_fv[mask]   = (p[mask] - opp_mean).abs()
-
-    # Pearson r(uncertainty, CF-FV) over valid nodes
-    u_n   = _estimate_entropy_uncertainty(model, data)
-    valid_cf = valid & (cf_fv > 1e-6)
-    if int(valid_cf.sum().item()) >= 10:
-        fv_v  = cf_fv[valid_cf].cpu().float()
-        u_v   = u_n[valid_cf].cpu().float()
-        fv_z  = fv_v - fv_v.mean()
-        u_z   = u_v  - u_v.mean()
-        denom = (fv_z.norm() * u_z.norm()).clamp(min=1e-8)
-        r_uf  = float((fv_z * u_z).sum() / denom)
-    else:
-        r_uf  = 0.0          # fallback: not enough signal
-
-    # Normalize CF-FV to [0, 1]
-    cf_fv = _minmax(cf_fv)
-
-    if was_training:
-        model.train()
-
-    return cf_fv.detach(), r_uf
-
 
 def compute_fiw_weights(
     data,
@@ -411,14 +317,8 @@ def compute_fiw_weights(
            alpha = Var(w_boundary) / (Var(w_boundary) + Var(w_degree))
            beta  = Var(w_degree)   / (Var(w_boundary) + Var(w_degree))
            s_struct(v) = alpha * w_boundary(v) + beta * w_degree(v)
-        3) Topology-aware uncertainty modulation via CF-FV direction:
-           Measure r(u, CF-FV) at runtime using counterfactual FV
-           (same metric as the empirical analysis in Sec. 4):
-             r >= 0  → Pattern B: high-u nodes are high-risk
-                        U_eff(v) = u(v)
-             r <  0  → Pattern A: low-u nodes are high-risk
-                        U_eff(v) = 1 - u(v)
-           FIW(v) ∝ s_struct(v) * (1 + fips_lam * U_eff(v))
+        3) Modulate gated nodes with uncertainty:
+           FIW(v) ∝ s_struct(v) * (1 + fips_lam * U(v))
 
     Graph regime detection:
         boundary_ratio ≥ 0.9 (saturated): w_boundary 변별력 붕괴
@@ -631,38 +531,14 @@ def compute_fiw_weights(
 
     u_n = _estimate_uncertainty(model, data, uncertainty_type=uncertainty_type)
 
-    # ── Topology-aware uncertainty direction via CF-FV ────────────────────────
-    # Compute counterfactual FV (same metric as Sec. 4 analysis) and measure
-    # Pearson r(u, CF-FV) to determine which direction uncertainty should
-    # modulate fairness intervention.
-    #
-    # Pattern A (r < 0): low-uncertainty boundary nodes carry highest FV.
-    #   → Use U_eff = 1 - u  so that low-u nodes receive HIGHER FIW.
-    # Pattern B (r ≥ 0): high-uncertainty × structural risk amplifies FV.
-    #   → Use U_eff = u  so that high-u nodes receive HIGHER FIW.
-    #
-    # CF-FV is O(N) via group-level aggregation; it adds negligible overhead.
-    # This branch is skipped for struct_only mode (no uncertainty used).
-    if fiw_weight_mode != "struct_only":
-        cf_fv_signal, r_uf = _compute_cf_fairness_violation(model, data)
-        unc_direction = "negative" if r_uf < 0 else "positive"
-        u_eff = (1.0 - u_n) if unc_direction == "negative" else u_n
-        print(
-            f"[FIW] unc_direction={unc_direction}  "
-            f"r(u,CF-FV)={r_uf:+.4f}  "
-            f"homophily={homophily:.4f}"
-        )
-    else:
-        r_uf, unc_direction, u_eff = 0.0, "none", u_n
-
     if fiw_weight_mode == "matched_random_perm":
-        # F7: preserve score-based Full-FIW weight distribution on random nodes.
+        # F7: preserve the score-based Full-FIW gated weight distribution,
+        # but assign it to random nodes. This isolates node assignment.
         n_gate = max(1, int(score_gate.sum().item()))
         score_gate_for_weights = score_gate
         if score_gate_for_weights.sum() == 0:
             score_gate_for_weights = gate
-        combined_score = struct_score[score_gate_for_weights] * (
-            1.0 + fips_lam * u_eff[score_gate_for_weights])
+        combined_score = struct_score[score_gate_for_weights] * (1.0 + fips_lam * u_n[score_gate_for_weights])
         combined_score = _minmax(combined_score)
         full_gate_weight = _WEIGHT_MIN + (_WEIGHT_MAX - _WEIGHT_MIN) * combined_score
 
@@ -681,17 +557,16 @@ def compute_fiw_weights(
             weight[gate] = _WEIGHT_MIN + (_WEIGHT_MAX - _WEIGHT_MIN) * gated_struct
 
         elif fiw_weight_mode == "binary_mean":
-            # F6: constant weight equal to mean Full-FIW gated weight.
-            combined = struct_score[gate] * (1.0 + fips_lam * u_eff[gate])
+            # F6: same FIW-selected nodes, but all gated nodes receive a constant
+            # weight equal to the mean Full-FIW gated weight.
+            combined = struct_score[gate] * (1.0 + fips_lam * u_n[gate])
             combined = _minmax(combined)
             full_gate_weight = _WEIGHT_MIN + (_WEIGHT_MAX - _WEIGHT_MIN) * combined
             weight[gate] = full_gate_weight.mean().detach()
 
         elif fiw_weight_mode == "continuous_uncert":
-            # Full FIW: continuous structural score with CF-FV-directed uncertainty.
-            # u_eff direction is determined by r(u, CF-FV) measured at runtime,
-            # ensuring consistency with the empirical analysis in Sec. 4.
-            combined = struct_score[gate] * (1.0 + fips_lam * u_eff[gate])
+            # Full FIW / F1 / F2 / F3: continuous structural score with uncertainty.
+            combined = struct_score[gate] * (1.0 + fips_lam * u_n[gate])
             combined = _minmax(combined)
             weight[gate] = _WEIGHT_MIN + (_WEIGHT_MAX - _WEIGHT_MIN) * combined
 
@@ -706,8 +581,6 @@ def compute_fiw_weights(
         gated=int(gate.sum().item()),
         n_total=N,
         uncertainty_type=uncertainty_type if fiw_weight_mode != "struct_only" else "none",
-        unc_direction=unc_direction,
-        r_uf=round(r_uf, 4),
         homophily=round(homophily, 4),
         gating_mode=gating_mode,
         fiw_weight_mode=fiw_weight_mode,
