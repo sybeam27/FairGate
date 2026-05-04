@@ -57,12 +57,19 @@ ADAPTIVE_FIW_DEFAULTS = {
     "adaptive_auc_tol": 0.005,
 }
 
+# DUAL_UQ_DEFAULTS = {
+#     # "dual": use learned interval-width σ(v) from the dedicated UQ head.
+#     # This is the primary uncertainty source for FIW modulation.
+#     "uncertainty_type": "dual",
+#     "lambda_uq": 0.01,
+#     "uq_width_penalty": 0.05,
+#     "use_uq_weighted_loss": False,
+# }
+
 DUAL_UQ_DEFAULTS = {
-    # "dual": use learned interval-width σ(v) from the dedicated UQ head.
-    # This is the primary uncertainty source for FIW modulation.
-    "uncertainty_type": "dual",
-    "lambda_uq": 0.01,
-    "uq_width_penalty": 0.05,
+    "uncertainty_type":     "dual",
+    "lambda_uq":            0.02,
+    "uq_width_penalty":     0.05,
     "use_uq_weighted_loss": False,
 }
 
@@ -84,15 +91,15 @@ DUAL_UQ_DEFAULTS = {
 # }
 
 FAIRGATE_CONFIGS = {
-    "pokec_z":     dict(lambda_fair=0.20, sbrs_quantile=0.9, struct_drop=0.5, warm_up=400),
-    "pokec_n":     dict(lambda_fair=0.20, sbrs_quantile=0.5, struct_drop=0.5, warm_up=400),
-    "pokec_z_g":   dict(lambda_fair=0.10, sbrs_quantile=0.9, struct_drop=0.5, warm_up=100),
-    "pokec_n_g":   dict(lambda_fair=0.10, sbrs_quantile=0.8, struct_drop=0.5, warm_up=400),
-    "credit":      dict(lambda_fair=0.05, sbrs_quantile=0.5, struct_drop=0.7, warm_up=200),
-    "recidivism":  dict(lambda_fair=0.20, sbrs_quantile=0.9, struct_drop=0.2, warm_up=100),
-    "income":      dict(lambda_fair=0.20, sbrs_quantile=0.5, struct_drop=0.7, warm_up=200),
-    "german":      dict(lambda_fair=0.20, sbrs_quantile=0.95, struct_drop=0.2, warm_up=100),
-    "nba":         dict(lambda_fair=0.20, sbrs_quantile=0.8, struct_drop=0.2, warm_up=200),
+    "pokec_z":    dict(lambda_fair=0.15, sbrs_quantile=0.80, struct_drop=0.2, warm_up=200),
+    "pokec_n":    dict(lambda_fair=0.15, sbrs_quantile=0.80, struct_drop=0.2, warm_up=200),
+    "pokec_z_g":  dict(lambda_fair=0.15, sbrs_quantile=0.80, struct_drop=0.2, warm_up=200),
+    "pokec_n_g":  dict(lambda_fair=0.15, sbrs_quantile=0.80, struct_drop=0.2, warm_up=200),
+    "credit":     dict(lambda_fair=0.20, sbrs_quantile=0.60, struct_drop=0.4, warm_up=200),
+    "recidivism": dict(lambda_fair=0.45, sbrs_quantile=0.70, struct_drop=0.5, warm_up=100),
+    "income":     dict(lambda_fair=0.20, sbrs_quantile=0.60, struct_drop=0.4, warm_up=200),
+    "german":     dict(lambda_fair=0.30, sbrs_quantile=0.70, struct_drop=0.5, warm_up=100),
+    "nba":        dict(lambda_fair=0.30, sbrs_quantile=0.70, struct_drop=0.5, warm_up=100),
 }
 
 # ── 비교 모델 목록 ────────────────────────────────────────────────────────

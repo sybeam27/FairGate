@@ -34,7 +34,7 @@ import argparse
 from datetime import datetime
 
 
-DEVICE = 'cuda:1'
+DEVICE = 'cuda:0'
 
 # ── 공통 학습 설정 (train.py / train_baselines.py 동일) ──────────────────
 COMMON_TRAIN = {
@@ -81,9 +81,10 @@ ALL_DATASETS = [
 
 BASELINE_MODELS = [
     # "GNN",
-    "NIFTY", "FairGB", "FairGT",
-    "EDITS", "FairEdit",
-    "FairGNN", "FairVGNN",
+    # "NIFTY", "FairGB", "FairGT",
+    # "EDITS", "FairEdit",
+    # "FairGNN", 
+    "FairVGNN",
     "FairWalk", "CrossWalk",
 ]
 
