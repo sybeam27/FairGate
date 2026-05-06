@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from utils.model_dualhead import FairGate, _auto_config_from_graph_stats
+from utils.model_fairgate import FairGate, _auto_config_from_graph_stats
 from utils.data  import get_dataset
 
 

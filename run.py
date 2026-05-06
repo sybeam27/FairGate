@@ -34,7 +34,7 @@ import argparse
 from datetime import datetime
 
 
-DEVICE = 'cuda:0'
+DEVICE = 'cuda:1'
 
 # ── 공통 학습 설정 (train.py / train_baselines.py 동일) ──────────────────
 COMMON_TRAIN = {
@@ -49,29 +49,58 @@ COMMON_TRAIN = {
 # ── Adaptive FIW 기본 설정 ─────────────────────────────────────────────
 ADAPTIVE_FIW_DEFAULTS = {
     "gating_mode_override": "adaptive",
+    # Use learned σ(v) from dual-head UQ for within-gate modulation.
+    # struct_only → continuous_uncert to activate uncertainty modulation.
     "fiw_weight_mode": "continuous_uncert",
     "adaptive_probe_epochs": 20,
     "adaptive_eta": 1.0,
     "adaptive_auc_tol": 0.005,
 }
 
+# DUAL_UQ_DEFAULTS = {
+#     # "dual": use learned interval-width σ(v) from the dedicated UQ head.
+#     # This is the primary uncertainty source for FIW modulation.
+#     "uncertainty_type": "dual",
+#     "lambda_uq": 0.01,
+#     "uq_width_penalty": 0.05,
+#     "use_uq_weighted_loss": False,
+# }
 
-# 수정본
-FAIRGATE_CONFIGS = {
-    # ── Pokec 계열 ──────────────────────────────────────────────────────────
-    "pokec_z":    dict(lambda_fair=0.10, sbrs_quantile=0.9, struct_drop=0.5, warm_up=400),
-    "pokec_z_g":  dict(lambda_fair=0.20, sbrs_quantile=0.9, struct_drop=0.5, warm_up=100),
-    "pokec_n":    dict(lambda_fair=0.15, sbrs_quantile=0.5, struct_drop=0.5, warm_up=400),
-    "pokec_n_g":  dict(lambda_fair=0.01, sbrs_quantile=0.8, struct_drop=0.5, warm_up=400),
-    # ── 소규모 그래프 ────────────────────────────────────────────────────────
-    "credit":     dict(lambda_fair=0.20, sbrs_quantile=0.5, struct_drop=0.7, warm_up=200),
-    "recidivism": dict(lambda_fair=0.10, sbrs_quantile=0.9, struct_drop=0.2, warm_up=100),
-    "income":     dict(lambda_fair=0.20, sbrs_quantile=0.5, struct_drop=0.7, warm_up=200),
-    "german":     dict(lambda_fair=0.20, sbrs_quantile=0.95, struct_drop=0.2, warm_up=100),
-    # "nba":        dict(lambda_fair=0.40, sbrs_quantile=0.5, struct_drop=0.3, warm_up=200),
-    "nba":       dict(lambda_fair=0.15, sbrs_quantile=0.8, struct_drop=0.2, warm_up=200),  # 유지
+DUAL_UQ_DEFAULTS = {
+    "uncertainty_type":     "dual",
+    "lambda_uq":            0.02,
+    "uq_width_penalty":     0.05,
+    "use_uq_weighted_loss": False,
 }
 
+
+# 수정본
+# FAIRGATE_CONFIGS = {
+#     # ── Pokec 계열 ──────────────────────────────────────────────────────────
+#     "pokec_z":    dict(lambda_fair=0.10, sbrs_quantile=0.9, struct_drop=0.5, warm_up=400),
+#     "pokec_z_g":  dict(lambda_fair=0.20, sbrs_quantile=0.9, struct_drop=0.5, warm_up=100),
+#     "pokec_n":    dict(lambda_fair=0.15, sbrs_quantile=0.5, struct_drop=0.5, warm_up=400),
+#     "pokec_n_g":  dict(lambda_fair=0.01, sbrs_quantile=0.8, struct_drop=0.5, warm_up=400),
+#     # ── 소규모 그래프 ────────────────────────────────────────────────────────
+#     "credit":     dict(lambda_fair=0.20, sbrs_quantile=0.5, struct_drop=0.7, warm_up=200),
+#     "recidivism": dict(lambda_fair=0.10, sbrs_quantile=0.9, struct_drop=0.2, warm_up=100),
+#     "income":     dict(lambda_fair=0.20, sbrs_quantile=0.5, struct_drop=0.7, warm_up=200),
+#     "german":     dict(lambda_fair=0.20, sbrs_quantile=0.95, struct_drop=0.2, warm_up=100),
+#     # "nba":        dict(lambda_fair=0.40, sbrs_quantile=0.5, struct_drop=0.3, warm_up=200),
+#     "nba":       dict(lambda_fair=0.15, sbrs_quantile=0.8, struct_drop=0.2, warm_up=200),  # 유지
+# }
+
+FAIRGATE_CONFIGS = {
+    "pokec_z":    dict(lambda_fair=0.15, sbrs_quantile=0.80, struct_drop=0.2, warm_up=200),
+    "pokec_n":    dict(lambda_fair=0.15, sbrs_quantile=0.80, struct_drop=0.2, warm_up=200),
+    "pokec_z_g":  dict(lambda_fair=0.15, sbrs_quantile=0.80, struct_drop=0.2, warm_up=200),
+    "pokec_n_g":  dict(lambda_fair=0.15, sbrs_quantile=0.80, struct_drop=0.2, warm_up=200),
+    "credit":     dict(lambda_fair=0.20, sbrs_quantile=0.60, struct_drop=0.4, warm_up=200),
+    "recidivism": dict(lambda_fair=0.45, sbrs_quantile=0.70, struct_drop=0.5, warm_up=100),
+    "income":     dict(lambda_fair=0.20, sbrs_quantile=0.60, struct_drop=0.4, warm_up=200),
+    "german":     dict(lambda_fair=0.30, sbrs_quantile=0.70, struct_drop=0.5, warm_up=100),
+    "nba":        dict(lambda_fair=0.30, sbrs_quantile=0.70, struct_drop=0.5, warm_up=100),
+}
 
 # ── 비교 모델 목록 ────────────────────────────────────────────────────────
 ALL_DATASETS = [
@@ -81,10 +110,9 @@ ALL_DATASETS = [
 
 BASELINE_MODELS = [
     # "GNN",
-    # "NIFTY", "FairGB", "FairGT",
-    # "EDITS", "FairEdit",
-    # "FairGNN", 
-    "FairVGNN",
+    "NIFTY", "FairGB", "FairGT",
+    "EDITS", "FairEdit",
+    "FairGNN", "FairVGNN",
     "FairWalk", "CrossWalk",
 ]
 
@@ -95,13 +123,17 @@ BASELINE_MODELS = [
 
 def build_fairgate_cmd(dataset: str, backbone: str, run_name: str, args=None) -> list:
     cfg = FAIRGATE_CONFIGS.get(dataset, FAIRGATE_CONFIGS["pokec_z"])
-    cmd = [sys.executable, "-m", "utils.train",
+    # args.runs overrides COMMON_TRAIN["runs"] if provided
+    common = COMMON_TRAIN.copy()
+    if args is not None and hasattr(args, 'runs'):
+        common["runs"] = args.runs
+    cmd = [sys.executable, "-m", "utils.train_fairgate",
            "--dataset",  dataset,
            "--backbone", backbone,
            "--device",   DEVICE,
            "--save_dir", "outputs/",
            "--run_name", run_name]
-    for k, v in {**COMMON_TRAIN, **cfg}.items():
+    for k, v in {**common, **cfg}.items():
         cmd += [f"--{k}", str(v)]
 
     adaptive_cfg = ADAPTIVE_FIW_DEFAULTS.copy()
@@ -116,6 +148,21 @@ def build_fairgate_cmd(dataset: str, backbone: str, run_name: str, args=None) ->
 
     for k, v in adaptive_cfg.items():
         cmd += [f"--{k}", str(v)]
+
+    uq_cfg = DUAL_UQ_DEFAULTS.copy()
+    if args is not None:
+        uq_cfg.update({
+            "uncertainty_type": args.uncertainty_type,
+            "lambda_uq": args.lambda_uq,
+            "uq_width_penalty": args.uq_width_penalty,
+            "use_uq_weighted_loss": args.use_uq_weighted_loss,
+        })
+    for k, v in uq_cfg.items():
+        if isinstance(v, bool):
+            if v:
+                cmd += [f"--{k}"]
+        else:
+            cmd += [f"--{k}", str(v)]
 
     if args is not None and args.fiw_adaptive:
         cmd += ["--fiw_adaptive"]
@@ -176,6 +223,10 @@ def run_all(args):
               f"wmode={args.fiw_weight_mode}  "
               f"adaptive_select={args.fiw_adaptive}  "
               f"probe={args.adaptive_probe_epochs}")
+        print(f"  UQ       : unc={args.uncertainty_type}  "
+              f"lambda_uq={args.lambda_uq}  "
+              f"width_penalty={args.uq_width_penalty}  "
+              f"weighted={args.use_uq_weighted_loss}")
     if mode in ("baselines", "all"):
         print(f"  baselines: {len(baseline_models)} models x {len(datasets)} datasets")
     print(f"  common   : lr={COMMON_TRAIN['lr']}  wd={COMMON_TRAIN['weight_decay']}  "
@@ -290,7 +341,23 @@ def parse_args():
                    default=ADAPTIVE_FIW_DEFAULTS["adaptive_auc_tol"],
                    help="Allowed validation AUC drop before penalty")
 
+    uq = p.add_argument_group("Dual-head Uncertainty Learning")
+    uq.add_argument("--uncertainty_type", type=str,
+                    default=DUAL_UQ_DEFAULTS["uncertainty_type"],
+                    choices=["entropy", "mc", "dual"],
+                    help="Uncertainty source. Use 'dual' with lambda_uq>0 for dual-head UQ.")
+    uq.add_argument("--lambda_uq", type=float,
+                    default=DUAL_UQ_DEFAULTS["lambda_uq"],
+                    help="Auxiliary dual-head UQ loss coefficient")
+    uq.add_argument("--uq_width_penalty", type=float,
+                    default=DUAL_UQ_DEFAULTS["uq_width_penalty"],
+                    help="Penalty on interval width in the dual-head UQ loss")
+    uq.add_argument("--use_uq_weighted_loss", action="store_true",
+                    help="Weight UQ loss by FIW node weights. Use after unweighted UQ is stable.")
+
     p.add_argument("--dry_run",  action="store_true")
+    p.add_argument("--runs",     type=int, default=COMMON_TRAIN["runs"],
+                   help="Number of runs per dataset")
     return p.parse_args()
 
 
